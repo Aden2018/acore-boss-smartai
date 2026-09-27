@@ -1882,11 +1882,36 @@ if type(aiCallback) == "function" and type(comboState) == "table" then
             "连招段：开场技能 = 当前预设 openingSkills[1]（确定性随机取第一项）")
     end
 
-    -- 第 2 次 AI 循环：走连招
+    -- 第 2 次 AI 循环：走连招。读条模式下连招第一发立即施放，其余进入 state.pendingCasts 队列
     comboBoss.casts, comboBoss.yells = {}, {}
     local secondOk, secondErr = pcall(aiCallback, 0, 2500, 0, comboBoss)
     assertTrue(secondOk, "连招段：第 2 次 AI 循环执行成功"
         .. (secondOk and "" or ("（" .. tostring(secondErr) .. "）")))
+
+    local queuedAfterTrigger = type(comboState.pendingCasts) == "table" and #comboState.pendingCasts or -1
+    assertTrue(#comboBoss.casts == 1 and queuedAfterTrigger == 2,
+        string.format("连招段：读条模式下触发 tick 只发第一发、其余 2 发入队（实际发 %d 发、队列 %d）",
+            #comboBoss.casts, queuedAfterTrigger))
+
+    -- 触发时刻的冷却快照：后面的排空 tick 会按 dt 递减 comboCooldowns，不能事后比对
+    local cooldownsAtTrigger = {}
+    if type(comboState.comboCooldowns) == "table" then
+        for name, cd in pairs(comboState.comboCooldowns) do cooldownsAtTrigger[name] = cd end
+    end
+    local globalComboCooldownAtTrigger = comboState.comboCooldown
+
+    -- 继续驱动 AI 直到队列排空（每个空闲 tick 发一发），累计序列才是完整连招
+    local drainTicks = 0
+    while drainTicks < 6 do
+        local queued = type(comboState.pendingCasts) == "table" and #comboState.pendingCasts or 0
+        if queued == 0 then break end
+        local drainOk, drainErr = pcall(aiCallback, 0, 2500, 0, comboBoss)
+        assertTrue(drainOk, "连招段：排空 pendingCasts 的 AI 循环执行成功"
+            .. (drainOk and "" or ("（" .. tostring(drainErr) .. "）")))
+        drainTicks = drainTicks + 1
+    end
+    assertTrue((type(comboState.pendingCasts) == "table" and #comboState.pendingCasts or 0) == 0,
+        "连招段：连招队列已排空（每个空闲 tick 发一发）")
 
     local chains = scaledComboChains()
     assertTrue(type(chains) == "table" and #chains > 0,
@@ -1930,10 +1955,11 @@ if type(aiCallback) == "function" and type(comboState) == "table" then
                 tostring(executedCombo.name), tostring(comboState.phase),
                 type(executedCombo.phase) == "table" and table.concat(executedCombo.phase, ",") or "nil"))
 
-        assertEq(type(comboState.comboCooldowns) == "table" and comboState.comboCooldowns[executedCombo.name] or nil,
-            executedCombo.cooldown,
-            "连招段：state.comboCooldowns[" .. tostring(executedCombo.name) .. "] = 该连招的 cooldown")
-        assertEq(comboState.comboCooldown, 5, "连招段：触发连招后全局连招冷却 state.comboCooldown=5")
+        assertEq(cooldownsAtTrigger[executedCombo.name], executedCombo.cooldown,
+            "连招段：触发时 state.comboCooldowns[" .. tostring(executedCombo.name)
+                .. "] = 该连招的 cooldown（触发 tick 快照）")
+        assertEq(globalComboCooldownAtTrigger, 5,
+            "连招段：触发连招后全局连招冷却 state.comboCooldown=5（触发 tick 快照）")
 
         assertTrue(#comboBoss.yells == 1, "连招段：连招触发时喊话一次（实际 " .. #comboBoss.yells .. " 次）")
         local expectedYell = type(comboYellMap) == "table" and comboYellMap[executedCombo.name] or nil

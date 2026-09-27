@@ -100,6 +100,16 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
   该脚本按**行首**锚定键名（避免 `烈焰余烬=` 被 `余烬=` 子串误判），可重复执行。
   另：池子里有 3 条法术来自 **5 人本**（King Dred / 达克萨隆要塞、Slad'ran / 古达克、Krick&Ick / 萨隆矿坑），
   已在注释里如实标注；若要严格"只用团本技能"，需要替换成团本等价法术（属内容决策，非缺陷）。
+- **施法方式（2026-09 改）**：`SkillAI:CastSkill` 现在走 `CastSpell(target, spellId, SKILL_CAST_TRIGGERED)`，
+  该常量当前为 **`false` = 副本式读条**（按 Spell.dbc 的施法时间前摇，可被玩家打断）。配套两项：
+  ① AI 每 tick 先查 `TargetSelector:IsCasting(creature)`，施法中不下发新指令（避免互相打断/丢技能）；
+  ② 连招不再同一 tick 连发，而是排进 `state.pendingCasts`，由空闲 tick 逐发排空（否则核心会拒绝后两发）。
+  池内约 1/3 的法术在 DBC 里 cast=0（瞬发），它们本来就没有前摇。想回到旧的瞬发手感：把该常量改成 `true`
+  （打断法术池保持触发式瞬发，不受影响）。
+- **半径上限约定**：技能池内所有法术的 `SpellRadius` 一律 ≤99yd —— 超过 99yd 在野外等价于"全地图 AoE"，
+  而 **50000yd 是 SpellRadius.dbc 的"无限"占位**（副本内是团本范围，野外会打到整张地图）。
+  2026-09 已把 11 条超限法术替换成同角色的团本替代品（含原有内容里的 `64386 惊骇尖啸`、`72034 霜至`
+  这两条 50000yd）；新增法术时请用 `sp2.lua oneline <id>` 复核 `radius` 列。
   新增连招的喊话落库脚本：`sql/2026_09_26_combo_yells_expansion.sql`（第一批 18 条）与
   `sql/2026_09_26_combo_yells_new_presets.sql`（4 套新预设的 24 条）——喊话存在扩展表 `taunt_combo_yells_text`，
   **库里的值会整体覆盖脚本默认值**，所以只改脚本默认文案线上不会生效。
@@ -232,12 +242,13 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 ## 不启动服务器也能测
 
-`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言 215 项不变量：
+`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言 219 项不变量：
 加载流程、两张配置表的 SQL 构造、扩展表建表/写入列一致性、命令标记、`.boss config show` 输出、
 「数据库值确实覆盖脚本默认值」、`.boss clear` 副作用、事件注册、定时启停、技能池随机、
 **技能池 / 连招内容**（连招法术必须在本预设池内、连招名全局唯一、每个预设至少 6 条连招、
 四档难度缩放后冷却与概率不撞 `ClampNumber(10,80)` 钳制、文件内默认库的连招喊话全覆盖）、
-**连招施放（离线驱动）**（假 Boss + 假玩家驱动真实的 `TryComboChain` 与施放循环，断言施放序列 == 某条连招、
+**连招施放（离线驱动）**（假 Boss + 假玩家驱动真实的 `TryComboChain` 与施放循环：触发 tick 只发第一发、其余进入
+`state.pendingCasts` 队列，之后的空闲 tick 逐发排空，累计施放序列 == 某条连招；连招冷却按**触发时刻快照**核对）、
 自身冷却与全局冷却写入、喊话内容 == 配置值）、
 6 个独立奖池（含跑通整条 `OnBossDied` 实发流程）、多区绑定，以及上面那些回归。用法见 `tools/boss-lua-smoke/README.md`。
 

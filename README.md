@@ -111,6 +111,20 @@ as a comma-separated key list).
   safe to re-run. Three pool spells come from **5-man dungeons** (King Dred / Drak'Tharon Keep,
   Slad'ran / Gundrak, Krick & Ick / Pit of Saron) and are now annotated as such; replacing them with raid
   equivalents is a content decision, not a bug fix.
+- **Cast mode (changed 2026-09)**: `SkillAI:CastSkill` now calls
+  `CastSpell(target, spellId, SKILL_CAST_TRIGGERED)` with the constant set to **`false` = dungeon-style
+  casting** (wind-up from the Spell.dbc cast time, interruptible). Two supporting changes: (1) every AI
+  tick first checks `TargetSelector:IsCasting(creature)` and issues no new order while casting, and
+  (2) combos are no longer fired in a single tick - they are pushed into `state.pendingCasts` and drained
+  one spell per idle tick (the core rejects the trailing spells otherwise). About a third of the pool
+  spells have `cast=0` in the DBC and are instant by nature. To go back to the old instant feel, flip the
+  constant to `true` (the interrupt spell pool stays triggered either way).
+- **Radius limit**: every pool spell must have `SpellRadius` <= 99yd - anything above is effectively a
+  zone-wide AoE in the open world, and **50000yd is SpellRadius.dbc's "unlimited" placeholder** (fine
+  inside a raid, hits the whole map outdoors). In 2026-09 eleven over-limit spells were swapped for
+  role-equivalent raid spells, including two 50000yd ones from the original content
+  (`64386 惊骇尖啸`, `72034 霜至`). When adding spells, verify the `radius` column with
+  `sp2.lua oneline <id>`.
   Combo yells for the expansions ship as `sql/2026_09_26_combo_yells_expansion.sql` (first expansion)
   and `sql/2026_09_26_combo_yells_new_presets.sql` (the four new presets): yells live in the
   ext-table column `taunt_combo_yells_text`, and **the database value replaces the script defaults
@@ -255,7 +269,7 @@ The activity boss uses dedicated level-83 templates with no `AIName`, no `smart_
 
 ## Testing without a server
 
-`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 215 invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values win over script defaults", `.boss clear` side effects, event registration, the daily schedule, the random skill preset, **skill pool / combo content** (every combo spell must live in its preset's pools, combo names globally unique, at least 6 combos per preset, 4 difficulties x 10 presets scale without hitting the `ClampNumber(10,80)` clamp, default-library yell coverage for every combo), **combo casting (offline driven)** (fake boss + fake player drive the real `TryComboChain` and cast loop: cast sequence equals a declared combo, per-combo and global cooldowns are written, the yell equals the configured text), the six reward pools (including a full `OnBossDied` payout run), multi-realm binding, and the regressions above. See `tools/boss-lua-smoke/README.md`.
+`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 219 invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values win over script defaults", `.boss clear` side effects, event registration, the daily schedule, the random skill preset, **skill pool / combo content** (every combo spell must live in its preset's pools, combo names globally unique, at least 6 combos per preset, 4 difficulties x 10 presets scale without hitting the `ClampNumber(10,80)` clamp, default-library yell coverage for every combo), **combo casting (offline driven)** (fake boss + fake player drive the real `TryComboChain` and cast loop: the trigger tick only fires the first spell and queues the rest, the queue drains one spell per idle tick, the accumulated cast sequence equals a declared combo, per-combo and global cooldowns are written at trigger time, the yell equals the configured text), the six reward pools (including a full `OnBossDied` payout run), multi-realm binding, and the regressions above. See `tools/boss-lua-smoke/README.md`.
 
 ```
 lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass
