@@ -92,9 +92,11 @@ local BOSS_CONFIG_KEY = "current"                            -- 本区 key：配
 local BOSS_DECIMAL_SCALE = 100                               -- 小数落库缩放（倍率/体型 ×100 存 INT）
 local BOSS_MAIN_TABLE = "boss_activity_config"               -- 与 AGMP 面板共享的配置表
 local BOSS_EXT_TABLE = "boss_activity_config_ext"            -- 脚本私有配置表（面板用 upsert 只改提交的列，不会删行重置）
-local BOSS_RUNTIME_TABLE = "boss_activity_runtime"           -- 运行态（活跃 Boss 指针/时间戳）
+local BOSS_RUNTIME_TABLE = "boss_activity_runtime"           -- 运行态（活跃 Boss 指针/时间戳/血量百分比）
 local BOSS_EVENT_TABLE = "boss_activity_events"              -- 事件流水
 local BOSS_CONTRIBUTOR_TABLE = "boss_activity_contributors"  -- 贡献快照
+local BOSS_REWARD_POOL_TABLE = "boss_reward_pools"           -- 奖池（任意数量，pool_id 即位号）
+local BOSS_MAX_REWARD_POOLS = 32                             -- 位图上限（reward_pools_mask 是 INT）
 local BOSS_SCHEMA_READY = false
 
 -- 多区部署自检：把本区绑定写进本区日志。面板页头也会显示它读的是哪个库，
@@ -439,6 +441,17 @@ local BOSS_CONFIG = {
     -- ---- [skill_random] 技能池随机（落库在扩展表，面板「扩展配置 → 技能池随机」） ----
     skillPresetRandomEnabled = false,
     skillPresetPoolText = "",
+
+    -- ---- [recovery] 跨重启恢复（落库在扩展表） ----
+    -- 停服/崩溃重启后：运行态里 status=spawned|engaged 的 Boss 会在首个定时 tick 按原刷新点、
+    -- 原技能预设、原难度重建，血量按重启前百分比折算（绝不做 save=true 静态刷怪）。
+    healthSampleIntervalSec = 15,      -- 战斗中血量采样（落库）节流，秒
+    recoveryMinHealthPct = 5,          -- 折算下限：重启前残血也不让恢复后直接进入濒死
+    bossRecoveredYell = "{BOSS_NAME} 卷土重来！（血量 {HEALTH_PCT}%）",
+
+    -- ---- [reward] 结算口径（落库在扩展表） ----
+    lastHitOnlyQualifies = false,      -- 只有最后一击、没有任何其它贡献的玩家是否算有效参战
+    offlineRewardDelivery = true,      -- 击杀时不在线的贡献者用邮件补发（物品 + 金币）
 }
 
 -- ---- [spawnpoints] 刷新点：Boss 重生时随机选取的坐标 ----
@@ -480,38 +493,87 @@ local HELPER_ENTRIES = {16244, 15976, 16018, 16165}
 -- ALLY_HELPER_ENTRY: 友方援军（帮助玩家攻击Boss）
 local ALLY_HELPER_ENTRY = 20977
 
--- ---- [reward] 奖励 ----
--- 6 个奖池彼此独立：每池各自掷一次 chance，各自抽一次获奖名单，互斥不作（一个人可以同时中多个池）。
+-- ---- [reward] 奖励：奖池（运行期数据来自 boss_reward_pools 表） ----
+-- 奖池数量不固定、每池独立配置（开关/概率/人数模式/人数/职业过滤/奖品/金币区间/是否公告）。
+-- 运行时读取顺序：`boss_reward_pools`（本区 state_key、未软删）→ 空表/缺表时回退出厂默认。
 -- 选人规则（winnerMode）：
---   all   = 全部有效参战者，此时 winnerCount 列不生效（面板/日志一律显示"全部有效参战"）
---   count = 从有效参战者里抽 winnerCount 人
--- ★ 抽签名额上限 = 有效参战人数：winnerCount ≥ 参战人数时该池退化成"全员发放"（等价于 all），
+--   all   = 全部有效参战者，此时 winner_count 不生效（面板/日志一律显示"全部有效参战"）
+--   count = 从有效参战者里抽 winner_count 人
+-- ★ 抽签名额上限 = 有效参战人数：winner_count ≥ 参战人数时该池退化成"全员发放"（等价于 all），
 --   日志会打 ⚠ 告警（见 §10 结算流程）。参战人数波动大时请把名额配得明显小于常见人数。
-local REWARD_POOL_COUNT = 6
-local REWARD_POOLS = {
+-- ★ 位号契约：poolId = k ↔ 贡献位图第 k-1 位（1 << (k-1)），上限 BOSS_MAX_REWARD_POOLS；
+--   删除池走软删除（deleted_at），poolId 不复用 —— 复用会让历史快照的位图解释错位。
+local REWARD_POOL_DEFAULTS = {
     -- 池 1：原「保底」——人人有份
-    { enabled = true,  chance = 100, winnerMode = "all",   winnerCount = 1, classFilter = true,
-      items = {40753} },
+    { poolId = 1, sortOrder = 10, name = "全员奖",   enabled = true,  chance = 100,
+      winnerMode = "all",   winnerCount = 1, classFilter = true, items = {40753} },
     -- 池 2：原「基础奖励池」
-    { enabled = true,  chance = 100, winnerMode = "count", winnerCount = 3, classFilter = true,
-      items = {38082, 41600, 51809, 34067} },
+    { poolId = 2, sortOrder = 20, name = "基础奖池", enabled = true,  chance = 100,
+      winnerMode = "count", winnerCount = 3, classFilter = true, items = {38082, 41600, 51809, 34067} },
     -- 池 3：原「公式奖励池」（附魔公式，人人可用）
-    { enabled = true,  chance = 10,  winnerMode = "count", winnerCount = 3, classFilter = true,
-      items = {45059, 44491} },
+    { poolId = 3, sortOrder = 30, name = "公式奖池", enabled = true,  chance = 10,
+      winnerMode = "count", winnerCount = 3, classFilter = true, items = {45059, 44491} },
     -- 池 4：原「坐骑奖励池」（坐骑人人可用）
-    { enabled = true,  chance = 15,  winnerMode = "count", winnerCount = 1, classFilter = true,
+    { poolId = 4, sortOrder = 40, name = "坐骑奖池", enabled = true,  chance = 15,
+      winnerMode = "count", winnerCount = 1, classFilter = true,
       items = {32768,30480,13335,37719,49282,49290,19872,33977,33809,37828,43963,54068,33183,33189,
                35513,43964,19902,43963,46109,50250,49286,30609,54860,37012} },
     -- 池 5：原「职业奖励池」（= 职业奖励池映射的去重并集；classFilter 保证每人只拿到自己职业的装备）
-    { enabled = true,  chance = 60,  winnerMode = "count", winnerCount = 3, classFilter = true,
+    { poolId = 5, sortOrder = 50, name = "职业奖池", enabled = true,  chance = 60,
+      winnerMode = "count", winnerCount = 3, classFilter = true,
       items = {40611,40614,40617,40620,40623,40256,40371,39257,40431,40257,40372,40622,40619,40616,
                40613,40610,40258,40382,39299,40624,40621,40618,40615,40612,40255,40373,40432} },
     -- 池 6：备用（默认关闭，GM 想再加一套奖池时直接开）
-    { enabled = false, chance = 0,   winnerMode = "count", winnerCount = 1, classFilter = true,
-      items = {} },
+    { poolId = 6, sortOrder = 60, name = "备用奖池", enabled = false, chance = 0,
+      winnerMode = "count", winnerCount = 1, classFilter = true, items = {} },
 }
 
--- 贡献/选人相关的全局开关（仍然在主表 boss_activity_config 里改）
+-- 运行期奖池表（由 LoadRewardPoolsFromDB 填充；表读不到时用出厂默认的深拷贝）
+local REWARD_POOLS = {}
+REWARD_POOLS_SOURCE = "code"
+
+-- 出厂默认池 → 运行期结构的深拷贝（含金币/公告字段的默认值）
+BuildDefaultRewardPools = function()
+    local list = {}
+    for _, default in ipairs(REWARD_POOL_DEFAULTS) do
+        local items = {}
+        for _, itemId in ipairs(default.items or {}) do
+            items[#items + 1] = itemId
+        end
+
+        list[#list + 1] = {
+            poolId = default.poolId,
+            sortOrder = default.sortOrder,
+            name = default.name,
+            enabled = default.enabled == true,
+            chance = default.chance,
+            winnerMode = default.winnerMode,
+            winnerCount = default.winnerCount,
+            classFilter = default.classFilter ~= false,
+            items = items,
+            goldMinCopper = tonumber(default.goldMinCopper) or 0,
+            goldMaxCopper = tonumber(default.goldMaxCopper) or 0,
+            announce = default.announce ~= false,
+        }
+    end
+
+    return list
+end
+
+REWARD_POOLS = BuildDefaultRewardPools()
+
+-- 位号 → 位图掩码：poolId = k ↔ 1 << (k-1)。用 2^bit 而不是位运算库；`reward_pools_mask`
+-- 是有符号 INT，第 32 位会溢出，所以 pool_id 上限取 BOSS_MAX_REWARD_POOLS（31）。
+GetRewardPoolMask = function(poolId)
+    local bit = math.floor(tonumber(poolId) or 0) - 1
+    if bit < 0 or bit >= BOSS_MAX_REWARD_POOLS then
+        return 0
+    end
+
+    return math.floor(2 ^ bit)
+end
+
+-- ---- [contrib] 贡献/选人相关的全局开关（仍然在主表 boss_activity_config 里改）
 local REWARD_PROBABILITIES = {
     participationRange = 80,             -- 统计战斗贡献时使用的有效范围（码）= "有效参战"的判定范围
     damageWeight = 100,                  -- 输出贡献权重
@@ -587,19 +649,14 @@ local BOSS_CONFIG_GROUPS = {
     class_ai = "职业类型（AI 选目标用）",
     class_reward = "职业过滤映射（奖池用）",
     reward = "奖励与结算",
-    reward_pool_1 = "奖池 1",
-    reward_pool_2 = "奖池 2",
-    reward_pool_3 = "奖池 3",
-    reward_pool_4 = "奖池 4",
-    reward_pool_5 = "奖池 5",
-    reward_pool_6 = "奖池 6",
+    recovery = "跨重启恢复",
     tier = "受管模板",
 }
 
 local BOSS_CONFIG_GROUP_ORDER = {
     "identity", "basic", "ally", "yells", "taunts", "ai", "phase", "patrol", "minion",
     "skill", "skill_random", "respawn", "spawnpoints", "schedule", "helper", "reward",
-    "reward_pool_1", "reward_pool_2", "reward_pool_3", "reward_pool_4", "reward_pool_5", "reward_pool_6",
+    "recovery",
     "class_ai", "class_reward", "tier",
 }
 
@@ -661,7 +718,7 @@ local BOSS_CONFIG_SCHEMA_MAIN = {
       target = "BOSS_CONFIG", key = "skillPreset" },
     { group = "skill", column = "skill_difficulty", kind = "text_keep",
       target = "BOSS_CONFIG", key = "skillDifficulty" },
-    -- reward（奖池本身在扩展表 [reward_pool_N] 组；这里只剩"谁算有效参战 / 怎么抽人"）
+    -- reward（奖池本体在 boss_reward_pools 表里，不再是配置列；这里只剩"谁算有效参战 / 怎么抽人"）
     { group = "reward", column = "random_reward_mode", kind = "text_keep",
       target = "REWARD_PROBABILITIES", key = "randomRewardMode" },
     { group = "reward", column = "participation_range", kind = "int", min = 20, max = 500,
@@ -784,79 +841,19 @@ local BOSS_CONFIG_SCHEMA_EXT = {
       ddl = "TINYINT NOT NULL DEFAULT 0", target = "BOSS_CONFIG", key = "skillPresetRandomEnabled" },
     { group = "skill_random", column = "skill_preset_pool_text", kind = "text",
       ddl = "VARCHAR(255) NOT NULL DEFAULT ''", target = "BOSS_CONFIG", key = "skillPresetPoolText" },
-    -- reward_pool_1..6（6 个独立奖池：每池 开关/概率/人数模式/人数/职业过滤/奖品列表）
-    { group = "reward_pool_1", column = "reward_pool_1_enabled", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "1.enabled" },
-    { group = "reward_pool_1", column = "reward_pool_1_chance", kind = "int", min = 0, max = 100,
-      ddl = "INT NOT NULL DEFAULT 100", target = "REWARD_POOLS", key = "1.chance" },
-    { group = "reward_pool_1", column = "reward_pool_1_winner_mode", kind = "text",
-      ddl = "VARCHAR(8) NOT NULL DEFAULT 'all'", target = "REWARD_POOLS", key = "1.winnerMode" },
-    { group = "reward_pool_1", column = "reward_pool_1_winner_count", kind = "int", min = 1, max = 100,
-      ddl = "INT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "1.winnerCount" },
-    { group = "reward_pool_1", column = "reward_pool_1_class_filter", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "1.classFilter" },
-    { group = "reward_pool_1", column = "reward_pool_1_items_text", kind = "intlist",
-      ddl = "TEXT NULL", target = "REWARD_POOLS", key = "1.items" },
-    { group = "reward_pool_2", column = "reward_pool_2_enabled", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "2.enabled" },
-    { group = "reward_pool_2", column = "reward_pool_2_chance", kind = "int", min = 0, max = 100,
-      ddl = "INT NOT NULL DEFAULT 100", target = "REWARD_POOLS", key = "2.chance" },
-    { group = "reward_pool_2", column = "reward_pool_2_winner_mode", kind = "text",
-      ddl = "VARCHAR(8) NOT NULL DEFAULT 'count'", target = "REWARD_POOLS", key = "2.winnerMode" },
-    { group = "reward_pool_2", column = "reward_pool_2_winner_count", kind = "int", min = 1, max = 100,
-      ddl = "INT NOT NULL DEFAULT 3", target = "REWARD_POOLS", key = "2.winnerCount" },
-    { group = "reward_pool_2", column = "reward_pool_2_class_filter", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "2.classFilter" },
-    { group = "reward_pool_2", column = "reward_pool_2_items_text", kind = "intlist",
-      ddl = "TEXT NULL", target = "REWARD_POOLS", key = "2.items" },
-    { group = "reward_pool_3", column = "reward_pool_3_enabled", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "3.enabled" },
-    { group = "reward_pool_3", column = "reward_pool_3_chance", kind = "int", min = 0, max = 100,
-      ddl = "INT NOT NULL DEFAULT 10", target = "REWARD_POOLS", key = "3.chance" },
-    { group = "reward_pool_3", column = "reward_pool_3_winner_mode", kind = "text",
-      ddl = "VARCHAR(8) NOT NULL DEFAULT 'count'", target = "REWARD_POOLS", key = "3.winnerMode" },
-    { group = "reward_pool_3", column = "reward_pool_3_winner_count", kind = "int", min = 1, max = 100,
-      ddl = "INT NOT NULL DEFAULT 3", target = "REWARD_POOLS", key = "3.winnerCount" },
-    { group = "reward_pool_3", column = "reward_pool_3_class_filter", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "3.classFilter" },
-    { group = "reward_pool_3", column = "reward_pool_3_items_text", kind = "intlist",
-      ddl = "TEXT NULL", target = "REWARD_POOLS", key = "3.items" },
-    { group = "reward_pool_4", column = "reward_pool_4_enabled", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "4.enabled" },
-    { group = "reward_pool_4", column = "reward_pool_4_chance", kind = "int", min = 0, max = 100,
-      ddl = "INT NOT NULL DEFAULT 15", target = "REWARD_POOLS", key = "4.chance" },
-    { group = "reward_pool_4", column = "reward_pool_4_winner_mode", kind = "text",
-      ddl = "VARCHAR(8) NOT NULL DEFAULT 'count'", target = "REWARD_POOLS", key = "4.winnerMode" },
-    { group = "reward_pool_4", column = "reward_pool_4_winner_count", kind = "int", min = 1, max = 100,
-      ddl = "INT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "4.winnerCount" },
-    { group = "reward_pool_4", column = "reward_pool_4_class_filter", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "4.classFilter" },
-    { group = "reward_pool_4", column = "reward_pool_4_items_text", kind = "intlist",
-      ddl = "TEXT NULL", target = "REWARD_POOLS", key = "4.items" },
-    { group = "reward_pool_5", column = "reward_pool_5_enabled", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "5.enabled" },
-    { group = "reward_pool_5", column = "reward_pool_5_chance", kind = "int", min = 0, max = 100,
-      ddl = "INT NOT NULL DEFAULT 60", target = "REWARD_POOLS", key = "5.chance" },
-    { group = "reward_pool_5", column = "reward_pool_5_winner_mode", kind = "text",
-      ddl = "VARCHAR(8) NOT NULL DEFAULT 'count'", target = "REWARD_POOLS", key = "5.winnerMode" },
-    { group = "reward_pool_5", column = "reward_pool_5_winner_count", kind = "int", min = 1, max = 100,
-      ddl = "INT NOT NULL DEFAULT 3", target = "REWARD_POOLS", key = "5.winnerCount" },
-    { group = "reward_pool_5", column = "reward_pool_5_class_filter", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "5.classFilter" },
-    { group = "reward_pool_5", column = "reward_pool_5_items_text", kind = "intlist",
-      ddl = "TEXT NULL", target = "REWARD_POOLS", key = "5.items" },
-    { group = "reward_pool_6", column = "reward_pool_6_enabled", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 0", target = "REWARD_POOLS", key = "6.enabled" },
-    { group = "reward_pool_6", column = "reward_pool_6_chance", kind = "int", min = 0, max = 100,
-      ddl = "INT NOT NULL DEFAULT 0", target = "REWARD_POOLS", key = "6.chance" },
-    { group = "reward_pool_6", column = "reward_pool_6_winner_mode", kind = "text",
-      ddl = "VARCHAR(8) NOT NULL DEFAULT 'count'", target = "REWARD_POOLS", key = "6.winnerMode" },
-    { group = "reward_pool_6", column = "reward_pool_6_winner_count", kind = "int", min = 1, max = 100,
-      ddl = "INT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "6.winnerCount" },
-    { group = "reward_pool_6", column = "reward_pool_6_class_filter", kind = "bool",
-      ddl = "TINYINT NOT NULL DEFAULT 1", target = "REWARD_POOLS", key = "6.classFilter" },
-    { group = "reward_pool_6", column = "reward_pool_6_items_text", kind = "intlist",
-      ddl = "TEXT NULL", target = "REWARD_POOLS", key = "6.items" },
+    -- [recovery] 跨重启恢复（新列插在 schedule 之前，保持 schedule 三列在描述表末尾）
+    { group = "recovery", column = "health_sample_interval_sec", kind = "int", min = 5, max = 600,
+      ddl = "INT NOT NULL DEFAULT 15", target = "BOSS_CONFIG", key = "healthSampleIntervalSec" },
+    { group = "recovery", column = "recovery_min_health_pct", kind = "int", min = 1, max = 100,
+      ddl = "INT NOT NULL DEFAULT 5", target = "BOSS_CONFIG", key = "recoveryMinHealthPct" },
+    { group = "recovery", column = "boss_recovered_yell", kind = "text",
+      ddl = "VARCHAR(255) NOT NULL DEFAULT '{BOSS_NAME} 卷土重来！（血量 {HEALTH_PCT}%）'",
+      target = "BOSS_CONFIG", key = "bossRecoveredYell" },
+    -- [reward] 结算口径（奖池本身在 boss_reward_pools 表里，不再是 ext 的列）
+    { group = "reward", column = "last_hit_only_qualifies", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 0", target = "BOSS_CONFIG", key = "lastHitOnlyQualifies" },
+    { group = "reward", column = "offline_reward_delivery", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "offlineRewardDelivery" },
     -- schedule（定时启停：列加在描述表末尾，面板 ext_fields 也必须加在末尾，列序要一致）
     { group = "schedule", column = "activity_schedule_enabled", kind = "bool",
       ddl = "TINYINT NOT NULL DEFAULT 0", target = "BOSS_CONFIG", key = "scheduleEnabled" },
@@ -892,45 +889,7 @@ RegisterConfigTarget("REWARD_PROBABILITIES",
     function(key) return REWARD_PROBABILITIES[key] end,
     function(key, value) REWARD_PROBABILITIES[key] = value end)
 
--- 奖池：描述表的 key 形如 "3.chance"（第 3 个池的 chance 字段）
-local REWARD_POOL_FIELDS = {
-    enabled = "enabled",
-    chance = "chance",
-    winnerMode = "winnerMode",
-    winnerCount = "winnerCount",
-    classFilter = "classFilter",
-    items = "items",
-}
-
-local function ParseRewardPoolKey(key)
-    local indexText, fieldName = string.match(tostring(key or ""), "^(%d+)%.(%w+)$")
-    local index = tonumber(indexText or "")
-    if not index or index < 1 or index > REWARD_POOL_COUNT then
-        return nil, nil
-    end
-    if not REWARD_POOL_FIELDS[fieldName] then
-        return nil, nil
-    end
-    return index, REWARD_POOL_FIELDS[fieldName]
-end
-
-RegisterConfigTarget("REWARD_POOLS",
-    function(key)
-        local index, fieldName = ParseRewardPoolKey(key)
-        if not index then
-            return nil
-        end
-        return REWARD_POOLS[index] and REWARD_POOLS[index][fieldName]
-    end,
-    function(key, value)
-        local index, fieldName = ParseRewardPoolKey(key)
-        if not index then
-            return
-        end
-        REWARD_POOLS[index] = REWARD_POOLS[index] or {}
-        REWARD_POOLS[index][fieldName] = value
-    end)
-
+-- 奖池不再是配置列：内容全部来自 boss_reward_pools 表（见 LoadRewardPoolsFromDB）。
 RegisterConfigTarget("SPAWN_POINTS",
     function() return SPAWN_POINTS end,
     function(_, value) SPAWN_POINTS = value end)
@@ -976,6 +935,52 @@ end
 
 --  配置区结束（§4 起为表结构自举与读写实现，正常调参不需要看下面）
 
+--  ---- 写库统一入口（写失败必须可见） ----
+--  mod-ale 的 `CharDBExecute` **没有返回值**（C++ 侧 `return 0;`，只调 Database.Execute），
+--  所以"检查返回值"这条路不存在。能做的三件事：
+--    1) pcall 包住，捕获语句拼接/参数类型的 Lua 侧异常；
+--    2) 写入前用列契约自检挡住 "Unknown column / 表不存在" 这类必然失败；
+--    3) 需要时按 verifySql 回读一次（查不到行 = 写入没落地），失败落日志并计数。
+--  失败计数由 `.boss config show`/`.boss config reload` 回执给 GM，避免"面板说已保存、库里没变"。
+local BossSql = {failures = {count = 0, last = "", lastAt = 0}}
+
+BossSql.record = function(what, reason)
+    BossSql.failures.count = BossSql.failures.count + 1
+    BossSql.failures.last = tostring(what or "sql")
+    BossSql.failures.lastAt = BossNow()
+    print(string.format(" [配置]写库失败[%s]：%s", tostring(what), tostring(reason)))
+end
+
+BossSql.exec = function(sql, what, verifySql)
+    local ok, err = pcall(function() CharDBExecute(sql) end)
+    if not ok then
+        BossSql.record(what, err)
+        return false
+    end
+
+    if verifySql ~= nil then
+        local verified, query = pcall(function() return CharDBQuery(verifySql) end)
+        if not verified or query == nil then
+            BossSql.record(what, "回读校验失败（语句已执行但数据没落地）")
+            return false
+        end
+    end
+
+    return true
+end
+
+-- 写库失败摘要（供 GM 命令回执：不再出现"面板说已保存、库里其实没变"）
+DescribeBossSqlFailures = function()
+    if BossSql.failures.count == 0 then
+        return "无"
+    end
+
+    return string.format("%d 次（最近一次: %s @ %s）",
+        BossSql.failures.count,
+        tostring(BossSql.failures.last),
+        os.date("%Y-%m-%d %H:%M:%S", tonumber(BossSql.failures.lastAt) or BossNow()))
+end
+
 local function BossSchemaColumnExists(tableName, columnName)
     local query = CharDBQuery(
         "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '"
@@ -990,22 +995,28 @@ local function BossSchemaColumnExists(tableName, columnName)
     return query ~= nil and query:GetUInt32(0) > 0
 end
 
-local function EnsureBossSchemaColumn(tableName, columnName, columnDefinition)
+-- 补列。afterColumn 给定时会用 `AFTER` 把新列插到描述表里的位置（物理列序与描述表一致，
+-- 便于 DBA 复核）；老库缺前置列等异常情况下退回"加到末尾"，不让补列本身失败。
+local function EnsureBossSchemaColumn(tableName, columnName, columnDefinition, afterColumn)
     if BossSchemaColumnExists(tableName, columnName) then
-        return
+        return true
     end
 
-    CharDBExecute(
-        'ALTER TABLE `'
-            .. BOSS_DB_NAME
-            .. '`.`'
-            .. tableName
-            .. '` ADD COLUMN `'
-            .. columnName
-            .. '` '
-            .. columnDefinition
-            .. ';'
-    )
+    local head = 'ALTER TABLE `' .. BOSS_DB_NAME .. '`.`' .. tableName .. '` ADD COLUMN `' .. columnName .. '` ' .. columnDefinition
+    local verifySql = "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '"
+        .. BOSS_DB_NAME .. "' AND TABLE_NAME = '" .. tableName .. "' AND COLUMN_NAME = '" .. columnName .. "';"
+
+    if afterColumn ~= nil and not BossSchemaColumnExists(tableName, afterColumn) then
+        afterColumn = nil
+    end
+
+    if afterColumn ~= nil then
+        if BossSql.exec(head .. ' AFTER `' .. afterColumn .. '`;', "补列 " .. tableName .. "." .. columnName, verifySql) then
+            return true
+        end
+    end
+
+    return BossSql.exec(head .. ';', "补列 " .. tableName .. "." .. columnName, verifySql)
 end
 
 -- 只在列真的存在时才 DROP，所以重复加载/多区加载都是安全的。
@@ -1014,15 +1025,15 @@ local function DropBossSchemaColumn(tableName, columnName)
         return false
     end
 
-    CharDBExecute(
+    BossSql.exec(
         'ALTER TABLE `'
             .. BOSS_DB_NAME
             .. '`.`'
             .. tableName
             .. '` DROP COLUMN `'
             .. columnName
-            .. '`;'
-    )
+            .. '`;',
+        "删列 " .. tableName .. "." .. columnName)
     print(" [配置]已删除废弃列: " .. tableName .. "." .. columnName)
     return true
 end
@@ -1064,7 +1075,7 @@ local function EnsureBossSchemaIndex(tableName, indexName, columnList)
         return
     end
 
-    CharDBExecute(
+    BossSql.exec(
         'ALTER TABLE `'
             .. BOSS_DB_NAME
             .. '`.`'
@@ -1073,8 +1084,193 @@ local function EnsureBossSchemaIndex(tableName, indexName, columnList)
             .. indexName
             .. '` ('
             .. columnList
-            .. ');'
+            .. ');',
+        "补索引 " .. tableName .. "." .. indexName)
+end
+
+local function GetQueryString(query, columnIndex, fallbackValue)
+    local success, value = pcall(function() return query:GetString(columnIndex) end)
+    if success and value ~= nil then
+        local text = tostring(value)
+        if text ~= "" then
+            return text
+        end
+    end
+
+    return fallbackValue
+end
+
+local function GetQueryRawString(query, columnIndex, fallbackValue)
+    local success, value = pcall(function() return query:GetString(columnIndex) end)
+    if success and value ~= nil then
+        return tostring(value)
+    end
+
+    return fallbackValue
+end
+
+local function GetQueryInt(query, columnIndex, fallbackValue)
+    local success, value = pcall(function() return query:GetInt32(columnIndex) end)
+    if success and value ~= nil then
+        local numericValue = tonumber(value)
+        if numericValue ~= nil then
+            return numericValue
+        end
+    end
+
+    return fallbackValue
+end
+
+local function GetQueryUInt(query, columnIndex, fallbackValue)
+    local success, value = pcall(function() return query:GetUInt32(columnIndex) end)
+    if success and value ~= nil then
+        local numericValue = tonumber(value)
+        if numericValue ~= nil then
+            return numericValue
+        end
+    end
+
+    return fallbackValue
+end
+
+local function GetQueryFloat(query, columnIndex, fallbackValue)
+    local success, value = pcall(function() return query:GetFloat(columnIndex) end)
+    if success and value ~= nil then
+        local numericValue = tonumber(value)
+        if numericValue ~= nil then
+            return numericValue
+        end
+    end
+
+    local stringSuccess, stringValue = pcall(function() return query:GetString(columnIndex) end)
+    if stringSuccess and stringValue ~= nil then
+        local numericValue = tonumber(stringValue)
+        if numericValue ~= nil then
+            return numericValue
+        end
+    end
+
+    return fallbackValue
+end
+
+--  ---- 列契约自检 ----
+--  「描述表 / 建表语句 / 面板 ext_fields / DBA 预建 DDL」任意一处漏改，都会以
+--  "Unknown column" 的形式在写入时静默失败。启动时按表比对一次期望列集合，缺列就点名。
+FetchExistingColumns = function(tableName, columnNames)
+    if #columnNames == 0 then
+        return {}
+    end
+
+    local quoted = {}
+    for _, columnName in ipairs(columnNames) do
+        quoted[#quoted + 1] = "'" .. columnName .. "'"
+    end
+
+    local query = CharDBQuery(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '"
+            .. BOSS_DB_NAME
+            .. "' AND TABLE_NAME = '"
+            .. tableName
+            .. "' AND COLUMN_NAME IN ("
+            .. table.concat(quoted, ",")
+            .. ");"
     )
+
+    if query == nil then
+        return nil
+    end
+
+    local present = {}
+    while true do
+        local columnName = GetQueryRawString(query, 0, nil)
+        if columnName ~= nil and columnName ~= "" then
+            present[columnName] = true
+        end
+
+        if type(query.NextRow) ~= "function" then
+            break
+        end
+
+        local advanced, hasNext = pcall(function() return query:NextRow() end)
+        if not advanced or hasNext ~= true then
+            break
+        end
+    end
+
+    return present
+end
+
+VerifyBossSchemaContracts = function()
+    local contracts = {
+        {table = BOSS_MAIN_TABLE, columns = BOSS_CONFIG_SCHEMA_MAIN},
+        {table = BOSS_EXT_TABLE, columns = BOSS_CONFIG_SCHEMA_EXT},
+    }
+
+    -- 固定表（列定义写死在 EnsureBossSchema 里，与面板的读列清单一一对应）
+    local fixedColumns = {
+        [BOSS_RUNTIME_TABLE] = {
+            "state_key", "boss_guid", "boss_entry", "boss_name", "map_id", "instance_id",
+            "home_x", "home_y", "home_z", "phase", "status", "skill_preset", "skill_difficulty",
+            "respawn_at", "last_spawn_at", "last_engage_at", "last_death_at", "last_reset_at",
+            "schedule_state", "schedule_window", "schedule_next_change_at",
+            "health_pct", "spawn_point_index", "last_health_sample_at", "updated_at",
+        },
+        [BOSS_CONTRIBUTOR_TABLE] = {
+            "state_key", "boss_guid", "boss_entry", "boss_name", "player_guid", "player_name",
+            "account_id", "class_id", "damage_done", "healing_done", "threat_samples",
+            "presence_samples", "contribution_score", "was_killer", "rewarded_random",
+            "guaranteed_reward", "reward_pools_mask", "created_at",
+        },
+        [BOSS_EVENT_TABLE] = {
+            "state_key", "boss_guid", "boss_entry", "boss_name", "event_type", "event_note",
+            "actor_name", "actor_guid", "payload_json", "created_at",
+        },
+        [BOSS_REWARD_POOL_TABLE] = {
+            "state_key", "pool_id", "sort_order", "name", "enabled", "chance", "winner_mode",
+            "winner_count", "class_filter", "items_text", "gold_min_copper", "gold_max_copper",
+            "announce", "deleted_at", "updated_at",
+        },
+    }
+
+    local missing = {}
+    for _, contract in ipairs(contracts) do
+        local names = {}
+        for _, descriptor in ipairs(contract.columns) do
+            names[#names + 1] = descriptor.column
+        end
+
+        local present = FetchExistingColumns(contract.table, names)
+        if present == nil then
+            missing[#missing + 1] = contract.table .. ".*（information_schema 读不到）"
+        else
+            for _, name in ipairs(names) do
+                if not present[name] then
+                    missing[#missing + 1] = contract.table .. "." .. name
+                end
+            end
+        end
+    end
+
+    for tableName, names in pairs(fixedColumns) do
+        local present = FetchExistingColumns(tableName, names)
+        if present == nil then
+            missing[#missing + 1] = tableName .. ".*（information_schema 读不到）"
+        else
+            for _, name in ipairs(names) do
+                if not present[name] then
+                    missing[#missing + 1] = tableName .. "." .. name
+                end
+            end
+        end
+    end
+
+    if #missing > 0 then
+        print(string.format(" [配置]列契约自检失败：%d 个期望列不存在 → %s",
+            #missing, table.concat(missing, ", ")))
+        return false, missing
+    end
+
+    return true, {}
 end
 
 --  §4 数据库表结构自举（ac_eluna）
@@ -1127,14 +1323,28 @@ local function EnsureBossExtTableColumns()
         return
     end
 
-    for _, descriptor in ipairs(BOSS_CONFIG_SCHEMA_EXT) do
-        EnsureBossSchemaColumn(BOSS_EXT_TABLE, descriptor.column, descriptor.ddl or 'TEXT NULL')
+    for index, descriptor in ipairs(BOSS_CONFIG_SCHEMA_EXT) do
+        -- 用前一个描述项的列做 AFTER：物理列序与描述表一致（DBA 复核 / 面板镜像都按这个顺序）
+        local afterColumn = nil
+        if index > 1 then
+            afterColumn = BOSS_CONFIG_SCHEMA_EXT[index - 1].column
+        end
+        EnsureBossSchemaColumn(BOSS_EXT_TABLE, descriptor.column, descriptor.ddl or 'TEXT NULL', afterColumn)
     end
 end
+
+-- 自检失败后的重试节流：失败时保持 READY=false（下一次写库会重试），但重试与告警最多每分钟一次，
+-- 避免"表建不出来"时被 AI tick 刷满日志。
+local bossSchemaRetryAt = 0
 
 local function EnsureBossSchema(force)
     if BOSS_SCHEMA_READY and not force then
         return true
+    end
+
+    local now = BossNow()
+    if not force and now < bossSchemaRetryAt then
+        return false
     end
 
     CharDBQuery('CREATE DATABASE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`;')
@@ -1160,6 +1370,9 @@ local function EnsureBossSchema(force)
         .. '`schedule_state` VARCHAR(16) NOT NULL DEFAULT "",'
         .. '`schedule_window` VARCHAR(64) NOT NULL DEFAULT "",'
         .. '`schedule_next_change_at` INT NOT NULL DEFAULT 0,'
+        .. '`health_pct` INT NOT NULL DEFAULT 100,'
+        .. '`spawn_point_index` INT NOT NULL DEFAULT -1,'
+        .. '`last_health_sample_at` INT NOT NULL DEFAULT 0,'
         .. '`updated_at` INT NOT NULL DEFAULT 0,'
         .. 'PRIMARY KEY (`state_key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
     CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_EVENT_TABLE .. '` ('
@@ -1188,6 +1401,7 @@ local function EnsureBossSchema(force)
         .. '`player_guid` INT NOT NULL DEFAULT 0,'
         .. '`player_name` VARCHAR(120) NOT NULL DEFAULT "",'
         .. '`account_id` INT NOT NULL DEFAULT 0,'
+        .. '`class_id` TINYINT NOT NULL DEFAULT 0,'
         .. '`damage_done` BIGINT NOT NULL DEFAULT 0,'
         .. '`healing_done` BIGINT NOT NULL DEFAULT 0,'
         .. '`threat_samples` INT NOT NULL DEFAULT 0,'
@@ -1234,6 +1448,26 @@ local function EnsureBossSchema(force)
     CharDBQuery(BuildBossExtTableSql())
     EnsureBossExtTableColumns()
 
+    -- 奖池表：与其余表同样由脚本自举（面板「奖池」页需要它存在；行数据由 LoadRewardPoolsFromDB 按出厂默认播种）
+    CharDBQuery('CREATE TABLE IF NOT EXISTS `' .. BOSS_DB_NAME .. '`.`' .. BOSS_REWARD_POOL_TABLE .. '` ('
+        .. '`state_key` VARCHAR(32) NOT NULL,'
+        .. '`pool_id` SMALLINT UNSIGNED NOT NULL,'
+        .. '`sort_order` INT NOT NULL DEFAULT 0,'
+        .. '`name` VARCHAR(120) NOT NULL DEFAULT "",'
+        .. '`enabled` TINYINT NOT NULL DEFAULT 1,'
+        .. '`chance` INT NOT NULL DEFAULT 100,'
+        .. '`winner_mode` VARCHAR(8) NOT NULL DEFAULT "count",'
+        .. '`winner_count` INT NOT NULL DEFAULT 1,'
+        .. '`class_filter` TINYINT NOT NULL DEFAULT 1,'
+        .. '`items_text` TEXT NULL,'
+        .. '`gold_min_copper` INT NOT NULL DEFAULT 0,'
+        .. '`gold_max_copper` INT NOT NULL DEFAULT 0,'
+        .. '`announce` TINYINT NOT NULL DEFAULT 1,'
+        .. '`deleted_at` INT NOT NULL DEFAULT 0,'
+        .. '`updated_at` INT NOT NULL DEFAULT 0,'
+        .. 'PRIMARY KEY (`state_key`, `pool_id`),'
+        .. 'KEY `idx_state_key_sort` (`state_key`, `sort_order`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;')
+
     EnsureBossSchemaColumn(
         BOSS_MAIN_TABLE,
         'spawn_points_text',
@@ -1245,7 +1479,17 @@ local function EnsureBossSchema(force)
     EnsureBossSchemaColumn(BOSS_RUNTIME_TABLE, 'schedule_window', 'VARCHAR(64) NOT NULL DEFAULT ""')
     EnsureBossSchemaColumn(BOSS_RUNTIME_TABLE, 'schedule_next_change_at', 'INT NOT NULL DEFAULT 0')
 
+    -- 跨重启恢复：重启前血量百分比 / 刷新点序号 / 上次血量采样时刻（面板「运行状态」也读血量%）
+    EnsureBossSchemaColumn(BOSS_RUNTIME_TABLE, 'health_pct', 'INT NOT NULL DEFAULT 100',
+        'schedule_next_change_at')
+    EnsureBossSchemaColumn(BOSS_RUNTIME_TABLE, 'spawn_point_index', 'INT NOT NULL DEFAULT -1',
+        'health_pct')
+    EnsureBossSchemaColumn(BOSS_RUNTIME_TABLE, 'last_health_sample_at', 'INT NOT NULL DEFAULT 0',
+        'spawn_point_index')
+
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'account_id', 'INT NOT NULL DEFAULT 0')
+    -- 职业：离线补发要按职业过滤奖品，而击杀时玩家可能已经下线 → 采样时就把职业落下来
+    EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'class_id', 'TINYINT NOT NULL DEFAULT 0', 'account_id')
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'healing_done', 'BIGINT NOT NULL DEFAULT 0')
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'threat_samples', 'INT NOT NULL DEFAULT 0')
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'presence_samples', 'INT NOT NULL DEFAULT 0')
@@ -1253,7 +1497,7 @@ local function EnsureBossSchema(force)
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'was_killer', 'TINYINT NOT NULL DEFAULT 0')
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'rewarded_random', 'TINYINT NOT NULL DEFAULT 0')
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'guaranteed_reward', 'TINYINT NOT NULL DEFAULT 0')
-    -- 6 个独立奖池的中奖位图（第 N 位 = 该玩家中过奖池 N）
+    -- 奖池中奖位图（第 k-1 位 = 该玩家中过 pool_id=k 的池；上限见 BOSS_MAX_REWARD_POOLS）
     EnsureBossSchemaColumn(BOSS_CONTRIBUTOR_TABLE, 'reward_pools_mask', 'INT NOT NULL DEFAULT 0')
 
     -- 多区共用同一个库时，事件/贡献表靠 state_key 分租；老库缺这一列时自动补上。
@@ -1265,9 +1509,17 @@ local function EnsureBossSchema(force)
     EnsureBossSchemaIndex(BOSS_CONTRIBUTOR_TABLE, 'idx_state_key_created', '`state_key`, `created_at`')
     EnsureBossSchemaIndex(BOSS_CONTRIBUTOR_TABLE, 'idx_state_key_player', '`state_key`, `player_guid`')
 
-    -- 旧奖励模型（保底/基础/公式/坐骑 + 金币）的列：已由 6 个独立奖池取代，连数据一起删除。
+    -- 旧奖励模型（保底/基础/公式/坐骑 + 金币）的列：已由奖池取代，连数据一起删除。
     for _, legacyColumn in ipairs(BOSS_LEGACY_REWARD_COLUMNS) do
         DropBossSchemaColumn(BOSS_MAIN_TABLE, legacyColumn)
+    end
+
+    -- 列契约自检通过后才置 READY：否则"面板显示已保存、库里其实没这一列"会一直静默下去。
+    local schemaOk, missingColumns = VerifyBossSchemaContracts()
+    if not schemaOk then
+        bossSchemaRetryAt = BossNow() + 60
+        BossSql.record("列契约自检", table.concat(missingColumns, ", "))
+        return false
     end
 
     BOSS_SCHEMA_READY = true
@@ -2223,70 +2475,6 @@ local function GetCurrentSkillDifficultyLabel()
     return ACTIVE_SKILL_DIFFICULTY_KEY .. "(" .. ACTIVE_SKILL_DIFFICULTY.displayName .. ")"
 end
 
-local function GetQueryString(query, columnIndex, fallbackValue)
-    local success, value = pcall(function() return query:GetString(columnIndex) end)
-    if success and value ~= nil then
-        local text = tostring(value)
-        if text ~= "" then
-            return text
-        end
-    end
-
-    return fallbackValue
-end
-
-local function GetQueryRawString(query, columnIndex, fallbackValue)
-    local success, value = pcall(function() return query:GetString(columnIndex) end)
-    if success and value ~= nil then
-        return tostring(value)
-    end
-
-    return fallbackValue
-end
-
-local function GetQueryInt(query, columnIndex, fallbackValue)
-    local success, value = pcall(function() return query:GetInt32(columnIndex) end)
-    if success and value ~= nil then
-        local numericValue = tonumber(value)
-        if numericValue ~= nil then
-            return numericValue
-        end
-    end
-
-    return fallbackValue
-end
-
-local function GetQueryUInt(query, columnIndex, fallbackValue)
-    local success, value = pcall(function() return query:GetUInt32(columnIndex) end)
-    if success and value ~= nil then
-        local numericValue = tonumber(value)
-        if numericValue ~= nil then
-            return numericValue
-        end
-    end
-
-    return fallbackValue
-end
-
-local function GetQueryFloat(query, columnIndex, fallbackValue)
-    local success, value = pcall(function() return query:GetFloat(columnIndex) end)
-    if success and value ~= nil then
-        local numericValue = tonumber(value)
-        if numericValue ~= nil then
-            return numericValue
-        end
-    end
-
-    local stringSuccess, stringValue = pcall(function() return query:GetString(columnIndex) end)
-    if stringSuccess and stringValue ~= nil then
-        local numericValue = tonumber(stringValue)
-        if numericValue ~= nil then
-            return numericValue
-        end
-    end
-
-    return fallbackValue
-end
 
 -- 按 UTF-8 边界截断，避免把多字节汉字切成半个字
 -- （MySQL 严格模式下，超长或被切断的字节会让整条 INSERT 失败并静默丢事件）
@@ -2506,40 +2694,213 @@ do
         end
     end
 
-    -- 列之间的约束与技能池应用（与旧版手写逻辑一致）
-    local function NormalizeRewardPools()
-        for index = 1, REWARD_POOL_COUNT do
-            local pool = REWARD_POOLS[index]
-            if type(pool) ~= "table" then
-                pool = {}
-                REWARD_POOLS[index] = pool
+    -- ---------------------------------------------------------------- 奖池（boss_reward_pools）
+    -- 奖池的权威来源是表（数量任意、每池独立配置、含金币区间）。表缺失 / 本区无行 / 读失败时
+    -- **回退出厂默认**（活动不会因为配置表异常而停摆），并把来源记进日志与 `.boss pools`。
+    local NormalizeRewardPools
+
+    -- 读结果集（ALEQuery：首行即可读，:NextRow() 返回 false 表示没有下一行）
+    local function ReadRewardPoolsFromQuery(query)
+        local pools = {}
+
+        while true do
+            pools[#pools + 1] = {
+                poolId = GetQueryUInt(query, 0, 0),
+                sortOrder = GetQueryInt(query, 1, 0),
+                name = GetQueryRawString(query, 2, ""),
+                enabled = GetQueryUInt(query, 3, 0) == 1,
+                chance = GetQueryInt(query, 4, 100),
+                winnerMode = GetQueryRawString(query, 5, "count"),
+                winnerCount = GetQueryInt(query, 6, 1),
+                classFilter = GetQueryUInt(query, 7, 1) == 1,
+                items = ParsePositiveIntegerList(GetQueryRawString(query, 8, "")),
+                goldMinCopper = GetQueryInt(query, 9, 0),
+                goldMaxCopper = GetQueryInt(query, 10, 0),
+                announce = GetQueryUInt(query, 11, 1) == 1,
+            }
+
+            if type(query.NextRow) ~= "function" then
+                break
             end
 
-            pool.enabled = pool.enabled == true
-            pool.chance = ClampInteger(pool.chance, 0, 100)
-            pool.winnerMode = (pool.winnerMode == "all") and "all" or "count"
-            pool.winnerCount = ClampInteger(pool.winnerCount, 1, 100)
-            pool.classFilter = pool.classFilter ~= false
-
-            if type(pool.items) ~= "table" then
-                pool.items = {}
-            else
-                local cleaned = {}
-                local seen = {}
-                for _, itemId in ipairs(pool.items) do
-                    local numericId = tonumber(itemId) or 0
-                    if numericId > 0 and not seen[numericId] then
-                        seen[numericId] = true
-                        table.insert(cleaned, math.floor(numericId))
-                    end
-                end
-                pool.items = cleaned
+            local advanced, hasNext = pcall(function() return query:NextRow() end)
+            if not advanced or hasNext ~= true then
+                break
             end
         end
+
+        return pools
+    end
+
+    LoadRewardPoolsFromDB = function()
+        local function QueryRewardPools()
+            local query = CharDBQuery(string.format(
+                "SELECT `pool_id`, `sort_order`, `name`, `enabled`, `chance`, `winner_mode`, `winner_count`, "
+                    .. "`class_filter`, `items_text`, `gold_min_copper`, `gold_max_copper`, `announce` "
+                    .. "FROM `%s`.`%s` WHERE `state_key` = '%s' AND `deleted_at` = 0 "
+                    .. "ORDER BY `sort_order`, `pool_id`;",
+                BOSS_DB_NAME,
+                BOSS_REWARD_POOL_TABLE,
+                BOSS_CONFIG_KEY
+            ))
+
+            if query == nil then
+                return nil
+            end
+
+            return ReadRewardPoolsFromQuery(query)
+        end
+
+        local function AdoptRewardPools(pools, source, note)
+            REWARD_POOLS = pools
+            REWARD_POOLS_SOURCE = source
+            NormalizeRewardPools()
+
+            local enabledCount = 0
+            for _, pool in ipairs(REWARD_POOLS) do
+                if pool.enabled then
+                    enabledCount = enabledCount + 1
+                end
+            end
+
+            print(string.format(" [奖池]%s：%d 个池（启用 %d 个，state_key=%s）。",
+                tostring(note), #REWARD_POOLS, enabledCount, BOSS_CONFIG_KEY))
+            return #REWARD_POOLS > 0
+        end
+
+        local pools = QueryRewardPools()
+        if pools ~= nil and #pools > 0 then
+            return AdoptRewardPools(pools, "db",
+                "已从 " .. BOSS_DB_NAME .. "." .. BOSS_REWARD_POOL_TABLE .. " 载入")
+        end
+
+        -- 表在（查询成功但本区没有行）→ 按出厂默认播种一次，让面板与运行期看到同一份池；
+        -- 播种失败或表不存在时不做任何事，内存里照样用出厂默认发奖。
+        if pools ~= nil then
+            local values = {}
+            for _, default in ipairs(REWARD_POOL_DEFAULTS) do
+                values[#values + 1] = string.format("('%s', %d, %d, '%s', %d, %d, '%s', %d, %d, '%s', 0, 0, 1, 0, %d)",
+                    BOSS_CONFIG_KEY,
+                    default.poolId,
+                    default.sortOrder,
+                    BossSqlEscape(default.name or "", 120),
+                    default.enabled == true and 1 or 0,
+                    tonumber(default.chance) or 0,
+                    BossSqlEscape(default.winnerMode or "count", 8),
+                    tonumber(default.winnerCount) or 1,
+                    default.classFilter ~= false and 1 or 0,
+                    BossSqlEscape(SerializePositiveIntegerList(default.items or {})),
+                    BossNow())
+            end
+
+            local seedSql = string.format(
+                "INSERT IGNORE INTO `%s`.`%s` (`state_key`, `pool_id`, `sort_order`, `name`, `enabled`, `chance`, "
+                    .. "`winner_mode`, `winner_count`, `class_filter`, `items_text`, `gold_min_copper`, "
+                    .. "`gold_max_copper`, `announce`, `deleted_at`, `updated_at`) VALUES %s;",
+                BOSS_DB_NAME, BOSS_REWARD_POOL_TABLE, table.concat(values, ","))
+
+            -- 回读校验：播种后本区必须能查到行（表被删/权限收紧时会失败并留日志）
+            local verifySql = string.format(
+                "SELECT `pool_id` FROM `%s`.`%s` WHERE `state_key` = '%s' AND `deleted_at` = 0 LIMIT 1;",
+                BOSS_DB_NAME, BOSS_REWARD_POOL_TABLE, BOSS_CONFIG_KEY)
+
+            if BossSql.exec(seedSql, "播种奖池 " .. BOSS_REWARD_POOL_TABLE, verifySql) then
+                pools = QueryRewardPools()
+                if pools ~= nil and #pools > 0 then
+                    return AdoptRewardPools(pools, "db",
+                        "已按出厂默认播种 " .. BOSS_DB_NAME .. "." .. BOSS_REWARD_POOL_TABLE)
+                end
+            end
+        end
+
+        REWARD_POOLS = BuildDefaultRewardPools()
+        REWARD_POOLS_SOURCE = "code"
+        NormalizeRewardPools()
+        print(string.format(
+            " [奖池]%s.%s 不可用或本区（state_key=%s）无数据，回退出厂默认 %d 个池（发奖不受影响）。",
+            BOSS_DB_NAME, BOSS_REWARD_POOL_TABLE, BOSS_CONFIG_KEY, #REWARD_POOLS))
+        return false
+    end
+
+    -- 奖池归一：非法 pool_id / 重复位号丢弃并告警，其余夹取到合法区间后按 sort_order 排序
+    NormalizeRewardPools = function()
+        local cleaned = {}
+        local seen = {}
+        local dropped = {}
+
+        for _, pool in ipairs(REWARD_POOLS) do
+            local poolId = math.floor(tonumber(pool.poolId) or 0)
+            if poolId < 1 or poolId > BOSS_MAX_REWARD_POOLS or seen[poolId] then
+                dropped[#dropped + 1] = tostring(pool.poolId)
+            else
+                seen[poolId] = true
+                pool.poolId = poolId
+                pool.sortOrder = math.floor(tonumber(pool.sortOrder) or poolId)
+                pool.name = SanitizeSingleLine(pool.name or "")
+                if pool.name == "" then
+                    pool.name = "奖池" .. poolId
+                end
+                pool.enabled = pool.enabled == true
+                pool.chance = ClampInteger(pool.chance, 0, 100)
+                pool.winnerMode = (pool.winnerMode == "all") and "all" or "count"
+                pool.winnerCount = ClampInteger(pool.winnerCount, 1, 100)
+                pool.classFilter = pool.classFilter ~= false
+                pool.announce = pool.announce ~= false
+                pool.goldMinCopper = ClampInteger(pool.goldMinCopper, 0, 2147483647)
+                pool.goldMaxCopper = ClampInteger(pool.goldMaxCopper, 0, 2147483647)
+                if pool.goldMaxCopper < pool.goldMinCopper then
+                    pool.goldMinCopper, pool.goldMaxCopper = pool.goldMaxCopper, pool.goldMinCopper
+                end
+
+                if type(pool.items) ~= "table" then
+                    pool.items = {}
+                else
+                    local items, itemSeen = {}, {}
+                    for _, itemId in ipairs(pool.items) do
+                        local numericId = tonumber(itemId) or 0
+                        if numericId > 0 and not itemSeen[numericId] then
+                            itemSeen[numericId] = true
+                            items[#items + 1] = math.floor(numericId)
+                        end
+                    end
+                    pool.items = items
+                end
+
+                cleaned[#cleaned + 1] = pool
+            end
+        end
+
+        if #dropped > 0 then
+            print(string.format(" [奖池]丢弃 %d 个非法奖池（pool_id 必须为 1-%d 且不重复）：%s",
+                #dropped, BOSS_MAX_REWARD_POOLS, table.concat(dropped, ", ")))
+        end
+
+        table.sort(cleaned, function(a, b)
+            if a.sortOrder == b.sortOrder then
+                return a.poolId < b.poolId
+            end
+            return a.sortOrder < b.sortOrder
+        end)
+
+        REWARD_POOLS = cleaned
+        return cleaned
     end
 
     local function FinalizeBossConfig()
-        BOSS_CONFIG.minionCountMax = math.max(BOSS_CONFIG.minionCountMin, BOSS_CONFIG.minionCountMax)
+        -- 取值对归一：面板可以把 min 填得比 max 大，math.random(min, max) 会直接抛错，
+        -- 进而丢掉整段玩法（小怪/援军/喊话）。所有 (min,max) 对都必须在这里拉平并告警。
+        local function NormalizeRangePair(minKey, maxKey, label)
+            local minValue = tonumber(BOSS_CONFIG[minKey]) or 0
+            local maxValue = tonumber(BOSS_CONFIG[maxKey]) or 0
+            if maxValue < minValue then
+                print(string.format(" [配置]%s 的数量区间写反了（min=%s > max=%s），已按 [%s, %s] 归一。",
+                    label, tostring(minValue), tostring(maxValue), tostring(minValue), tostring(minValue)))
+                BOSS_CONFIG[maxKey] = minValue
+            end
+        end
+
+        NormalizeRangePair("minionCountMin", "minionCountMax", "小怪数量")
+        NormalizeRangePair("phase2SummonCountMin", "phase2SummonCountMax", "阶段2援军数量")
 
         REWARD_PROBABILITIES:validate()
         NormalizeRewardPools()
@@ -2681,12 +3042,28 @@ do
     end
 
     -- insertIgnore = true：引导写入，只在「数据库里还没有这一行」时补默认值
+    -- 返回值 = 两张表都真的写进去了（回读校验），调用方据此给 GM 明确回执
     PersistBossConfigToDB = function(insertIgnore)
-        EnsureBossSchema()
+        if not EnsureBossSchema() then
+            BossLog(" [配置]跳过写库：表结构自检未通过（列缺失，见上一条日志）")
+            return false
+        end
+
         REWARD_PROBABILITIES:validate()
 
-        CharDBExecute(BuildBossUpsertSql(BOSS_MAIN_TABLE, BOSS_CONFIG_SCHEMA_MAIN, insertIgnore))
-        CharDBExecute(BuildBossUpsertSql(BOSS_EXT_TABLE, BOSS_CONFIG_SCHEMA_EXT, insertIgnore))
+        local mainOk = BossSql.exec(
+            BuildBossUpsertSql(BOSS_MAIN_TABLE, BOSS_CONFIG_SCHEMA_MAIN, insertIgnore),
+            "写主表 " .. BOSS_MAIN_TABLE,
+            string.format("SELECT `updated_at` FROM `%s`.`%s` WHERE `state_key` = '%s' LIMIT 1;",
+                BOSS_DB_NAME, BOSS_MAIN_TABLE, BOSS_CONFIG_KEY))
+
+        local extOk = BossSql.exec(
+            BuildBossUpsertSql(BOSS_EXT_TABLE, BOSS_CONFIG_SCHEMA_EXT, insertIgnore),
+            "写扩展表 " .. BOSS_EXT_TABLE,
+            string.format("SELECT `updated_at` FROM `%s`.`%s` WHERE `state_key` = '%s' LIMIT 1;",
+                BOSS_DB_NAME, BOSS_EXT_TABLE, BOSS_CONFIG_KEY))
+
+        return mainOk and extOk
     end
 
     LoadBossConfigFromDB = function()
@@ -2713,6 +3090,9 @@ do
         else
             print(" [配置]未读取到 " .. BOSS_EXT_TABLE .. "，喊话/嘲讽/巡逻等使用文件内默认值。")
         end
+
+        -- 4) 奖池：权威来源是 boss_reward_pools 表（读不到就回退出厂默认，见 LoadRewardPoolsFromDB）
+        LoadRewardPoolsFromDB()
 
         local configuredEntry, configuredName = FinalizeBossConfig()
 
@@ -2755,11 +3135,21 @@ local bossRuntimeState = {
     lastEngageAt = 0,
     lastDeathAt = 0,
     lastResetAt = 0,
+    -- 跨重启恢复：重启前血量百分比 / 生成时用的刷新点序号 / 上次采样时刻 / 技能预设
+    healthPct = 100,
+    spawnPointIndex = -1,
+    lastHealthSampleAt = 0,
+    skillPreset = "",
+    skillDifficulty = "",
     -- 定时启停的运行态上报（面板「运行状态」读这三项；由 tick 在状态翻转时落库）
     scheduleState = "",
     scheduleWindow = "",
     scheduleNextChangeAt = 0,
 }
+
+-- 脚本加载时若运行态仍是 spawned|engaged（= 上次停服/崩溃前有一只在场），
+-- 只置这个标志；真正的重建放在首个定时 tick（加载期地图/世界未必就绪）。
+local runtimeRecoveryPending = false
 
 --  §8.5 定时启停（时间段解析 / 命中判定 / 下次切换）
 --  配置项在 §3 的 [schedule] 组（ext 表列：activity_schedule_enabled /
@@ -3254,6 +3644,9 @@ local function PersistBossRuntime(source, overrides)
     if overrides.schedule_state ~= nil then bossRuntimeState.scheduleState = overrides.schedule_state end
     if overrides.schedule_window ~= nil then bossRuntimeState.scheduleWindow = overrides.schedule_window end
     if overrides.schedule_next_change_at ~= nil then bossRuntimeState.scheduleNextChangeAt = overrides.schedule_next_change_at end
+    if overrides.health_pct ~= nil then bossRuntimeState.healthPct = ClampInteger(overrides.health_pct, 0, 100) end
+    if overrides.spawn_point_index ~= nil then bossRuntimeState.spawnPointIndex = math.floor(tonumber(overrides.spawn_point_index) or -1) end
+    if overrides.last_health_sample_at ~= nil then bossRuntimeState.lastHealthSampleAt = tonumber(overrides.last_health_sample_at) or 0 end
 
     local bossGuid = overrides.boss_guid
     if bossGuid == nil then bossGuid = context.bossGuid or 0 end
@@ -3290,8 +3683,9 @@ local function PersistBossRuntime(source, overrides)
             .. "`state_key`, `boss_guid`, `boss_entry`, `boss_name`, `map_id`, `instance_id`, "
             .. "`home_x`, `home_y`, `home_z`, `phase`, `status`, `skill_preset`, `skill_difficulty`, "
             .. "`respawn_at`, `last_spawn_at`, `last_engage_at`, `last_death_at`, `last_reset_at`, "
-            .. "`schedule_state`, `schedule_window`, `schedule_next_change_at`, `updated_at`) "
-            .. "VALUES ('%s', %d, %d, '%s', %d, %d, %.3f, %.3f, %.3f, %d, '%s', '%s', '%s', %d, %d, %d, %d, %d, '%s', '%s', %d, %d);",
+            .. "`schedule_state`, `schedule_window`, `schedule_next_change_at`, "
+            .. "`health_pct`, `spawn_point_index`, `last_health_sample_at`, `updated_at`) "
+            .. "VALUES ('%s', %d, %d, '%s', %d, %d, %.3f, %.3f, %.3f, %d, '%s', '%s', '%s', %d, %d, %d, %d, %d, '%s', '%s', %d, %d, %d, %d, %d);",
         BOSS_DB_NAME,
         BOSS_RUNTIME_KEY,
         tonumber(bossGuid or 0) or 0,
@@ -3314,10 +3708,50 @@ local function PersistBossRuntime(source, overrides)
         BossSqlEscape(bossRuntimeState.scheduleState or "", 16),
         BossSqlEscape(bossRuntimeState.scheduleWindow or "", 64),
         tonumber(bossRuntimeState.scheduleNextChangeAt or 0) or 0,
+        ClampInteger(bossRuntimeState.healthPct or 100, 0, 100),
+        math.floor(tonumber(bossRuntimeState.spawnPointIndex) or -1),
+        tonumber(bossRuntimeState.lastHealthSampleAt or 0) or 0,
         BossNow()
     )
 
-    CharDBExecute(sql)
+    -- 回读校验：写失败（列缺失/权限收紧/语句被拒）必须留下日志，不能"面板说已保存、库里没变"
+    return BossSql.exec(sql, "写运行态 " .. BOSS_RUNTIME_TABLE, string.format(
+        "SELECT `status` FROM `%s`.`%s` WHERE `state_key` = '%s' LIMIT 1;",
+        BOSS_DB_NAME, BOSS_RUNTIME_TABLE, BOSS_RUNTIME_KEY))
+end
+
+--  血量采样（跨重启折算的依据）
+--  persist ~= false 时按 [recovery].health_sample_interval_sec 节流写库；force = true 绕过节流。
+--  只在 status ∈ {spawned, engaged} 时有意义；调用方负责把结果带进自己的运行态写入。
+SampleBossHealth = function(creature, force, persist)
+    if not IsUnitValid(creature) then
+        return nil
+    end
+
+    local maxHealth = tonumber(creature:GetMaxHealth() or 0) or 0
+    local health = tonumber(creature:GetHealth() or 0) or 0
+    if maxHealth <= 0 then
+        return nil
+    end
+
+    local healthPct = ClampInteger(math.floor((health / maxHealth) * 100 + 0.5), 0, 100)
+    if persist == false then
+        return healthPct
+    end
+
+    local now = BossNow()
+    local interval = math.max(5, tonumber(BOSS_CONFIG.healthSampleIntervalSec) or 15)
+    if not force and (now - (tonumber(bossRuntimeState.lastHealthSampleAt) or 0)) < interval then
+        return healthPct
+    end
+
+    PersistBossRuntime(creature, {
+        status = bossRuntimeState.status,
+        health_pct = healthPct,
+        last_health_sample_at = now,
+    })
+
+    return healthPct
 end
 
 local function BossStatusIndicatesActive(status)
@@ -3355,7 +3789,7 @@ local function LoadBossRuntimeFromDB()
     EnsureBossSchema()
 
     local query = CharDBQuery(string.format(
-        "SELECT `boss_guid`, `boss_entry`, `boss_name`, `map_id`, `instance_id`, `home_x`, `home_y`, `home_z`, `phase`, `status`, `respawn_at`, `last_spawn_at`, `last_engage_at`, `last_death_at`, `last_reset_at`, `schedule_state`, `schedule_window`, `schedule_next_change_at` FROM `%s`.`boss_activity_runtime` WHERE `state_key`='%s' LIMIT 1;",
+        "SELECT `boss_guid`, `boss_entry`, `boss_name`, `map_id`, `instance_id`, `home_x`, `home_y`, `home_z`, `phase`, `status`, `respawn_at`, `last_spawn_at`, `last_engage_at`, `last_death_at`, `last_reset_at`, `schedule_state`, `schedule_window`, `schedule_next_change_at`, `health_pct`, `spawn_point_index`, `last_health_sample_at`, `skill_preset`, `skill_difficulty` FROM `%s`.`boss_activity_runtime` WHERE `state_key`='%s' LIMIT 1;",
         BOSS_DB_NAME,
         BOSS_RUNTIME_KEY
     ))
@@ -3382,6 +3816,11 @@ local function LoadBossRuntimeFromDB()
     local runtimeScheduleState = GetQueryString(query, 15, "")
     local runtimeScheduleWindow = GetQueryString(query, 16, "")
     local runtimeScheduleNextChangeAt = GetQueryUInt(query, 17, 0)
+    local runtimeHealthPct = GetQueryUInt(query, 18, 100)
+    local runtimeSpawnPointIndex = GetQueryInt(query, 19, -1)
+    local runtimeLastHealthSampleAt = GetQueryUInt(query, 20, 0)
+    local runtimeSkillPreset = GetQueryString(query, 21, "")
+    local runtimeSkillDifficulty = GetQueryString(query, 22, "")
 
     bossRuntimeState.phase = runtimePhase
     bossRuntimeState.status = runtimeStatus
@@ -3393,6 +3832,11 @@ local function LoadBossRuntimeFromDB()
     bossRuntimeState.scheduleState = runtimeScheduleState
     bossRuntimeState.scheduleWindow = runtimeScheduleWindow
     bossRuntimeState.scheduleNextChangeAt = runtimeScheduleNextChangeAt
+    bossRuntimeState.healthPct = ClampInteger(runtimeHealthPct, 0, 100)
+    bossRuntimeState.spawnPointIndex = runtimeSpawnPointIndex
+    bossRuntimeState.lastHealthSampleAt = runtimeLastHealthSampleAt
+    bossRuntimeState.skillPreset = runtimeSkillPreset
+    bossRuntimeState.skillDifficulty = runtimeSkillDifficulty
 
     if runtimeGuid > 0 and runtimeEntry > 0 and BossStatusIndicatesActive(runtimeStatus) then
         currentActiveBossGUID = runtimeGuid
@@ -3411,6 +3855,12 @@ local function LoadBossRuntimeFromDB()
             homeZ = runtimeHomeZ,
             homeO = 0,
         }
+
+        -- 跨重启恢复：只置标志，真正的重建放到首个定时 tick（见 SpawnBossFromRuntime）
+        runtimeRecoveryPending = true
+        print(string.format(
+            " [恢复]检测到停服前的活跃 Boss（entry=%d，血量 %d%%，status=%s），将在首个 tick 重建。",
+            runtimeEntry, bossRuntimeState.healthPct, tostring(runtimeStatus)))
     else
         ClearActiveBoss()
     end
@@ -3438,7 +3888,7 @@ end
         BossNow()
     )
 
-    CharDBExecute(sql)
+    BossSql.exec(sql, "写事件 " .. tostring(eventType or ""))
 end
 
 local function BuildSafeThreatList(unit, cachedThreatList)
@@ -3533,13 +3983,34 @@ local function ResolvePlayerContributor(unit)
     return nil
 end
 
-local function IsWithinActiveEncounterRange(unit, range)
-    if not IsUnitValid(unit) or not activeBossInfo then return false end
-
-    local successMap, mapId = pcall(function() return unit:GetMapId() end)
-    if not successMap or mapId ~= activeBossInfo.mapId then
+--  同副本判定：多区/多副本共用一张地图时，只比 map_id 会把别的副本实例里的玩家算进来
+--  （世界地图 instance_id 恒为 0，实例地图才会 >0）。
+IsInActiveEncounterInstance = function(unit)
+    if not IsUnitValid(unit) or not activeBossInfo then
         return false
     end
+
+    local successMap, mapId = pcall(function() return unit:GetMapId() end)
+    if not successMap or tonumber(mapId or 0) ~= tonumber(activeBossInfo.mapId or 0) then
+        return false
+    end
+
+    local bossInstanceId = tonumber(activeBossInfo.instanceId or 0) or 0
+    if bossInstanceId <= 0 then
+        return true
+    end
+
+    local successInstance, instanceId = pcall(function() return unit:GetInstanceId() end)
+    if not successInstance or instanceId == nil then
+        return false
+    end
+
+    return tonumber(instanceId or 0) == bossInstanceId
+end
+
+local function IsWithinActiveEncounterRange(unit, range)
+    if not IsUnitValid(unit) or not activeBossInfo then return false end
+    if not IsInActiveEncounterInstance(unit) then return false end
 
     local dx = unit:GetX() - activeBossInfo.x
     local dy = unit:GetY() - activeBossInfo.y
@@ -3576,6 +4047,9 @@ local function GetOrCreateContributionRecord(bossGuid, player)
     local key, guid, guidLow = GetContributionIdentity(player)
     local accountId = 0
     pcall(function() accountId = tonumber(player:GetAccountId() or 0) or 0 end)
+    -- 职业：击杀时玩家可能已经下线，离线补发要按职业过滤奖品 → 采样时就落进记录
+    local classId = 0
+    pcall(function() classId = tonumber(player:GetClass() or 0) or 0 end)
     local record = state.players[key]
     if not record then
         record = {
@@ -3583,6 +4057,7 @@ local function GetOrCreateContributionRecord(bossGuid, player)
             guid = guid,
             guidLow = guidLow,
             accountId = accountId,
+            classId = classId,
             name = SafeGetUnitName(player),
             damageDone = 0,
             healingDone = 0,
@@ -3597,6 +4072,9 @@ local function GetOrCreateContributionRecord(bossGuid, player)
     record.guidLow = record.guidLow or guidLow
     if (record.accountId or 0) <= 0 and accountId > 0 then
         record.accountId = accountId
+    end
+    if (record.classId or 0) <= 0 and classId > 0 then
+        record.classId = classId
     end
     record.name = SafeGetUnitName(player)
     return state, record
@@ -3635,18 +4113,58 @@ local function TrackEncounterPresence(creature, threatList)
     if not IsUnitValid(creature) then return end
 
     local bossGuid = creature:GetGUIDLow()
-    for _, player in ipairs(BuildNearbyPlayerList(creature, REWARD_PROBABILITIES.participationRange)) do
+    local seen = {}
+
+    -- 出勤（在场）：同一 tick 内每个玩家只记一次 —— 曾经"附近玩家列表 + 威胁表"各记一份，
+    -- 同一个人在同一 tick 会被累加两次，出勤权重被系统性放大。
+    local function TrackPresence(player)
+        if not IsUnitValid(player) then return end
+
+        local key = GetContributionIdentity(player)
+        if seen["presence:" .. key] then return end
+        seen["presence:" .. key] = true
         AddContributionMetrics(bossGuid, player, {presence = 1})
+    end
+
+    for _, player in ipairs(BuildNearbyPlayerList(creature, REWARD_PROBABILITIES.participationRange)) do
+        TrackPresence(player)
     end
 
     if threatList then
         for _, unit in ipairs(threatList) do
             local player = ResolvePlayerContributor(unit)
             if player then
-                AddContributionMetrics(bossGuid, player, {threat = 1, presence = 1})
+                TrackPresence(player)
+
+                -- 仇恨样本同样按玩家去重：宠物与主人都在威胁表里时只算一份
+                local key = GetContributionIdentity(player)
+                if not seen["threat:" .. key] then
+                    seen["threat:" .. key] = true
+                    AddContributionMetrics(bossGuid, player, {threat = 1})
+                end
             end
         end
     end
+end
+
+--  有效参战者（结算、选人、快照三处共用同一份口径，不允许各写一套）
+--    * 有过输出 / 治疗 / 仇恨记录 → 有效
+--    * 只有最后一击、没有任何其它记录 → 由 [reward].last_hit_only_qualifies 决定（默认不算）
+--    * 只是在场旁观（仅有 presence）→ 不算
+IsQualifiedContributor = function(record)
+    if type(record) ~= "table" then
+        return false
+    end
+
+    if (record.damageDone or 0) > 0 or (record.healingDone or 0) > 0 or (record.threatSamples or 0) > 0 then
+        return true
+    end
+
+    if record.isKiller then
+        return BOSS_CONFIG.lastHitOnlyQualifies == true
+    end
+
+    return false
 end
 
 local function ComputeContributionScore(record, state)
@@ -3680,17 +4198,16 @@ local function BuildContributorRewardPool(bossGuid, killer)
 
     local contributors = {}
     for _, record in pairs(state.players) do
-        local hasCoreContribution = record.damageDone > 0 or record.healingDone > 0 or record.threatSamples > 0 or record.isKiller
-        if hasCoreContribution then
+        if IsQualifiedContributor(record) then
+            -- player = nil 表示结算时该玩家已下线：不能直接踢掉（他打过就是打过），
+            -- 由结算阶段走邮件补发。
             local player = record.guid and SafeGetPlayerByGUID(record.guid) or nil
-            if player then
-                local score = ComputeContributionScore(record, state)
-                table.insert(contributors, {
-                    player = player,
-                    score = score,
-                    record = record,
-                })
-            end
+            local score = ComputeContributionScore(record, state)
+            table.insert(contributors, {
+                player = player,
+                score = score,
+                record = record,
+            })
         end
     end
 
@@ -3739,13 +4256,7 @@ local function PersistBossContributorSnapshots(source, state, rewardedRandomKeys
     if not state or not state.players then return end
 
     for key, record in pairs(state.players) do
-        local hasContribution = (record.damageDone or 0) > 0
-            or (record.healingDone or 0) > 0
-            or (record.threatSamples or 0) > 0
-            or (record.presenceSamples or 0) > 0
-            or record.isKiller
-
-        if hasContribution then
+        if IsQualifiedContributor(record) then
             local score = ComputeContributionScore(record, state)
             InsertBossContributorSnapshot(
                 source,
@@ -3900,6 +4411,21 @@ function TargetSelector:IsCasting(unit)
     return success and isCasting
 end
 
+--  打断预筛距离 = 打断池里最远的那个法术的射程。
+--  写死 10 码会让 25/30 码的打断法术永远选不中（预筛就把目标筛掉了），
+--  打断池改了射程这里自动跟随。
+local function GetInterruptPrescreenRange()
+    local maxRange = 0
+    for _, interruptSpell in ipairs(INTERRUPT_SPELL_LIBRARY) do
+        local range = tonumber(interruptSpell.maxRange) or 0
+        if range > maxRange then
+            maxRange = range
+        end
+    end
+
+    return maxRange > 0 and maxRange or 10
+end
+
 -- 从威胁列表中查找正在施法的玩家
 -- 返回: 正在施法的玩家列表，按威胁优先级排序
 -- @param cachedThreatList: 可选，缓存的威胁列表，避免重复获取
@@ -3910,6 +4436,8 @@ function TargetSelector:FindCastingPlayers(creature, cachedThreatList)
     if not threatList or #threatList == 0 then
         return {}
     end
+
+    local prescreenRange = GetInterruptPrescreenRange()
     
     local castingPlayers = {}
     for _, unit in ipairs(threatList) do
@@ -3917,8 +4445,8 @@ function TargetSelector:FindCastingPlayers(creature, cachedThreatList)
             local success, isPlayer = pcall(function() return unit:IsPlayer() end)
             if success and isPlayer then
                 local dist = creature:GetDistance(unit)
-                -- 只考虑距离内的施法玩家（打断技能通常有距离限制，约5-8码）
-                if dist <= 10 then
+                -- 只考虑打断池射程内的施法玩家（射程取自打断池，见 GetInterruptPrescreenRange）
+                if dist <= prescreenRange then
                     local isCasting = self:IsCasting(unit)
                     if isCasting then
                         -- 计算施法威胁评分
@@ -4377,9 +4905,10 @@ local function RegisterBossPatrol(creature)
         if obj:IsInCombat() then return end
         if currentActiveBossGUID ~= guid or not activeBossInfo then return end
 
-        local centerX = activeBossInfo.x
-        local centerY = activeBossInfo.y
-        local centerZ = activeBossInfo.z
+        -- 脱缰判定的中心必须是「刷新点」。activeBossInfo.x/y/z 会被 AI 循环每 tick 覆盖成
+        -- 实时坐标（用它可以做射程判定，但不能做归位判定），刷新点存在 homeX/homeY/homeZ。
+        local centerX = tonumber(activeBossInfo.homeX) or activeBossInfo.x
+        local centerY = tonumber(activeBossInfo.homeY) or activeBossInfo.y
         local distanceFromCenter = math.sqrt(((obj:GetX() - centerX) ^ 2) + ((obj:GetY() - centerY) ^ 2))
 
         if distanceFromCenter > BOSS_CONFIG.patrolLeashRadius then
@@ -4607,6 +5136,9 @@ local function SmartBossAI(event, delay, calls, creature)
         bossThreatSnapshots[guid] = enhancedSnapshot
     end
     TrackEncounterPresence(creature, currentThreatList)
+
+    -- 血量采样（跨重启折算的依据）：按 [recovery].health_sample_interval_sec 节流写库
+    SampleBossHealth(creature)
     
     -- 计算阶段（阈值可配：[phase] 组）
     local hp = creature:GetHealthPct()
@@ -4624,6 +5156,8 @@ local function SmartBossAI(event, delay, calls, creature)
         PersistBossRuntime(creature, {
             status = "engaged",
             phase = state.phase,
+            health_pct = SampleBossHealth(creature, false, false),
+            last_health_sample_at = BossNow(),
         })
         InsertBossEvent(creature, "phase_change", "阶段从 " .. tostring(prevPhase) .. " 切换到 " .. tostring(state.phase) .. "。", "", 0, {
             from_phase = prevPhase,
@@ -4868,7 +5402,11 @@ end
 
 local function OnBossFightPlayerHeal(event, player, target, gain)
     if not currentActiveBossGUID or gain <= 0 then return end
-    if not IsUnitValid(player) or not IsWithinActiveEncounterRange(player, REWARD_PROBABILITIES.participationRange) then
+    if not IsUnitValid(player) then return end
+
+    -- 口径对齐：伤害侧从不校验攻击者距离（远程职业本来就站得远），治疗侧也不该要求
+    -- "治疗者本人在半径内" —— 只要求同一个副本实例，且**被治疗者**是这场战斗的参战者。
+    if not IsInActiveEncounterInstance(player) then
         return
     end
 
@@ -4894,6 +5432,13 @@ end
 
 -- ========== Boss管理函数 ==========
 local function HasActiveBoss()
+    -- 跨重启恢复：运行态说"停服前有一只"，但那只生物已经不在了 —— 这**不是**僵尸记录，
+    -- 而是待恢复的正常状态。恢复逻辑（首个定时 tick 的 SpawnBossFromRuntime）要拿到第一拍，
+    -- 所以这里既不认活跃、也不清理；恢复成功或失败后标志清零，行为回到现状。
+    if runtimeRecoveryPending then
+        return false
+    end
+
     if currentActiveBossGUID and IsUnitValid(activeBossCreature) then
         local activeEntry = tonumber(activeBossCreature:GetEntry() or 0) or 0
         if IsManagedBossEntry(activeEntry) then
@@ -5093,8 +5638,17 @@ local function ApplyBossTraits(creature, opts)
 end
 
 -- ========== Boss生成函数 ==========
-local function SpawnRandomBoss(instanceId)
+--  force = true：跳过"时段外不生成"的闸门（GM 调试用 `.boss spawn force` 走的是另一条路径，
+--  这里留给控制台调用）
+local function SpawnRandomBoss(instanceId, force)
     if HasActiveBoss() then return nil end
+
+    -- 时段门控放在生成函数首行：重生回调（CreateLuaEvent）自己也要复检，
+    -- 否则"排重生时在时段内、到点已在时段外"会生成到时段外（关窗逻辑管不到一个还没生成的 Boss）。
+    if force ~= true and BOSS_CONFIG.scheduleEnabled == true and IsBossScheduleClosed(BossNow()) then
+        print(" [定时启停]当前不在时间段内，跳过本次生成。")
+        return nil
+    end
 
     -- 检查BOSS_CANDIDATES是否为空
     if not BOSS_CANDIDATES or #BOSS_CANDIDATES == 0 then
@@ -5115,7 +5669,8 @@ local function SpawnRandomBoss(instanceId)
     local bossName = bossCandidate.name
     print(" [调试信息] 本轮已选择Boss: " .. bossName .. " (Entry: " .. entry .. ")")
 
-    local spawnPoint = SPAWN_POINTS[math.random(#SPAWN_POINTS)]
+    local spawnPointIndex = math.random(#SPAWN_POINTS)
+    local spawnPoint = SPAWN_POINTS[spawnPointIndex]
     local boss = PerformIngameSpawn(1, entry, spawnPoint.mapId, instanceId, 
                                      spawnPoint.x, spawnPoint.y, spawnPoint.z, 0, false, 0, 1)
 
@@ -5137,10 +5692,14 @@ local function SpawnRandomBoss(instanceId)
             phase = 1,
             respawn_at = 0,
             last_spawn_at = spawnTime,
+            spawn_point_index = spawnPointIndex,
+            health_pct = 100,
+            last_health_sample_at = spawnTime,
         })
         InsertBossEvent(boss, "spawn", "Boss 已在配置刷新点生成。", "", 0, {
             map_id = spawnPoint.mapId,
             instance_id = tonumber(instanceId or 0) or 0,
+            spawn_point_index = spawnPointIndex,
             skill_preset = ACTIVE_SKILL_PRESET_KEY or BOSS_CONFIG.skillPreset,
             skill_difficulty = ACTIVE_SKILL_DIFFICULTY_KEY or BOSS_CONFIG.skillDifficulty,
             skill_preset_random = BOSS_CONFIG.skillPresetRandomEnabled == true,
@@ -5150,6 +5709,172 @@ local function SpawnRandomBoss(instanceId)
         print(" [调试信息]Boss生成失败！")
     end
     return nil
+end
+
+--  跨重启恢复：按运行态记录重建一只 Boss
+--  口径（docs/restart-survival-plan.md）：存活 = 活动不中断，允许重建新生物对象，
+--  但必须回到同一刷新点、同一档位模板、同一技能预设，血量按重启前百分比折算。
+--  失败不重试（写完事件就回到 idle，交给定时启停的正常补刷逻辑）。
+ResolveRecoverySpawnPoint = function()
+    local index = math.floor(tonumber(bossRuntimeState.spawnPointIndex) or -1)
+    if index >= 1 and index <= #SPAWN_POINTS then
+        return SPAWN_POINTS[index], index
+    end
+
+    -- 老版本运行态没有刷新点序号：按 home_* 就近匹配（阈值 5 码）
+    local homeX = tonumber(activeBossInfo and activeBossInfo.homeX) or 0
+    local homeY = tonumber(activeBossInfo and activeBossInfo.homeY) or 0
+    local bestIndex, bestDistance = nil, nil
+    for pointIndex, point in ipairs(SPAWN_POINTS) do
+        local dx = (tonumber(point.x) or 0) - homeX
+        local dy = (tonumber(point.y) or 0) - homeY
+        local distance = math.sqrt((dx * dx) + (dy * dy))
+        if bestDistance == nil or distance < bestDistance then
+            bestIndex, bestDistance = pointIndex, distance
+        end
+    end
+
+    if bestIndex ~= nil and (bestDistance or 999) <= 5 then
+        return SPAWN_POINTS[bestIndex], bestIndex
+    end
+
+    return nil, -1
+end
+
+local function SpawnBossFromRuntime()
+    runtimeRecoveryPending = false
+
+    local runtime = activeBossInfo
+    local previousGuid = tonumber(runtime and runtime.guid or 0) or 0
+    local entry = tonumber(runtime and runtime.entry or 0) or 0
+    local mapId = tonumber(runtime and runtime.mapId or 0) or 0
+    local instanceId = tonumber(runtime and runtime.instanceId or 0) or 0
+    local runtimeName = tostring(runtime and runtime.name or "")
+
+    local minPct = ClampInteger(BOSS_CONFIG.recoveryMinHealthPct or 5, 1, 100)
+    local healthPct = ClampInteger(bossRuntimeState.healthPct or 100, 0, 100)
+    if healthPct < minPct then
+        healthPct = minPct
+    end
+
+    local function ResetRuntimeToIdle()
+        ClearActiveBoss()
+        PersistBossRuntime(nil, {
+            boss_guid = 0,
+            boss_entry = 0,
+            boss_name = "",
+            map_id = 0,
+            instance_id = 0,
+            home_x = 0,
+            home_y = 0,
+            home_z = 0,
+            status = "idle",
+            phase = 0,
+            respawn_at = 0,
+            health_pct = 0,
+            spawn_point_index = -1,
+            last_health_sample_at = 0,
+        })
+    end
+
+    local function RecoveryFailed(reason)
+        InsertBossEvent(nil, "runtime_recovery_failed", "跨重启恢复失败：" .. tostring(reason), "", 0, {
+            previous_guid = previousGuid,
+            entry = entry,
+            health_pct = healthPct,
+            reason = tostring(reason),
+        })
+        ResetRuntimeToIdle()
+        print(" [恢复]重建失败：" .. tostring(reason) .. "（不再重试，交给定时启停的正常补刷）")
+        return nil
+    end
+
+    if entry <= 0 or not IsManagedBossEntry(entry) then
+        return RecoveryFailed("运行态里的 entry 非法或不在受管模板集合内：" .. tostring(entry))
+    end
+
+    if BOSS_CONFIG.scheduleEnabled == true and IsBossScheduleClosed(BossNow()) then
+        InsertBossEvent(nil, "runtime_recovered_skipped", "停服前有活跃 Boss，但当前不在活动时间段内，未恢复。", "", 0, {
+            previous_guid = previousGuid,
+            entry = entry,
+            health_pct = healthPct,
+            window = tostring(bossRuntimeState.scheduleWindow or ""),
+        })
+        ResetRuntimeToIdle()
+        print(" [恢复]当前不在时间段内，已按关窗语义清理运行态。")
+        return nil
+    end
+
+    local spawnPoint, spawnPointIndex = ResolveRecoverySpawnPoint()
+    local spawnX = tonumber(spawnPoint and spawnPoint.x) or tonumber(runtime and runtime.homeX) or 0
+    local spawnY = tonumber(spawnPoint and spawnPoint.y) or tonumber(runtime and runtime.homeY) or 0
+    local spawnZ = tonumber(spawnPoint and spawnPoint.z) or tonumber(runtime and runtime.homeZ) or 0
+
+    local boss = PerformIngameSpawn(1, entry, mapId, instanceId, spawnX, spawnY, spawnZ, 0, false, 0, 1)
+    if not boss then
+        return RecoveryFailed("PerformIngameSpawn 返回 nil（地图不可用或模板缺失）")
+    end
+
+    SetActiveBoss(boss)
+    ApplyBossTraits(boss, {
+        homeX = spawnX,
+        homeY = spawnY,
+        homeZ = spawnZ,
+        homeO = 0,
+    })
+
+    -- 技能预设沿用停服前那一套（技能池随机抽到的结果也要延续，不能重启就换套）
+    local presetKey = tostring(bossRuntimeState.skillPreset or "")
+    local difficultyKey = tostring(bossRuntimeState.skillDifficulty or "")
+    if not SKILL_PRESET_LIBRARY[presetKey] then
+        print(string.format(" [恢复]运行态里的技能预设 '%s' 已不存在，改用默认预设 %s。",
+            presetKey, tostring(BOSS_CONFIG.skillPreset)))
+        presetKey = BOSS_CONFIG.skillPreset
+    end
+
+    activeBossSkillPresetKey = presetKey
+    ApplySkillConfig(presetKey, difficultyKey)
+
+    -- 血量折算必须排在 ApplyBossTraits 之后：首次应用会把血回满
+    local maxHealth = tonumber(boss:GetMaxHealth() or 0) or 0
+    local targetHealth = math.max(1, math.floor(maxHealth * healthPct / 100 + 0.5))
+    boss:SetHealth(math.min(targetHealth, math.max(1, maxHealth)))
+
+    local recoveredAt = BossNow()
+    local bossName = ResolveBossCandidateName(entry, runtimeName)
+    PersistBossRuntime(boss, {
+        status = "spawned",
+        phase = 1,
+        respawn_at = 0,
+        last_spawn_at = recoveredAt,
+        spawn_point_index = spawnPointIndex,
+        health_pct = healthPct,
+        last_health_sample_at = recoveredAt,
+    })
+
+    InsertBossEvent(boss, "runtime_recovered", string.format(
+        "跨重启恢复：按停服前血量 %d%% 重建（原 GUID %d）。", healthPct, previousGuid), "", 0, {
+        previous_guid = previousGuid,
+        entry = entry,
+        skill_preset = ACTIVE_SKILL_PRESET_KEY or presetKey,
+        skill_difficulty = ACTIVE_SKILL_DIFFICULTY_KEY or difficultyKey,
+        health_pct = healthPct,
+        spawn_point_index = spawnPointIndex,
+        map_id = mapId,
+        instance_id = instanceId,
+    })
+
+    local recoveredYell = tostring(BOSS_CONFIG.bossRecoveredYell or "")
+    if recoveredYell ~= "" then
+        recoveredYell = string.gsub(recoveredYell, "{BOSS_NAME}", bossName)
+        recoveredYell = string.gsub(recoveredYell, "{HEALTH_PCT}", tostring(healthPct))
+        boss:SendUnitYell(recoveredYell, 0)
+    end
+
+    print(string.format(" [恢复]已重建 Boss（GUID %d，entry=%d，刷新点 #%d，血量 %d%%，预设 %s）。",
+        boss:GetGUIDLow(), entry, spawnPointIndex, healthPct, tostring(presetKey)))
+
+    return boss
 end
 
 local function CancelRespawnTimer()
@@ -5267,6 +5992,13 @@ do
     end
 
     ApplyBossScheduleTick = function(event, delay, calls)
+        -- 跨重启恢复优先于一切：加载期不生成（地图/世界未必就绪），首个 tick 才是恢复点。
+        -- 放在 scheduleEnabled 判断之前 —— 定时启停关着的时候同样要恢复。
+        if runtimeRecoveryPending then
+            SpawnBossFromRuntime()
+            return
+        end
+
         if BOSS_CONFIG.scheduleEnabled ~= true then
             if status.signature ~= "off" then
                 status.active = nil
@@ -5348,7 +6080,15 @@ do
                     window = window,
                     next_change_at = nextChangeAt,
                 })
+            -- 关窗一定要收敛一次运行态：clearOnClose=false 时旧代码什么都不写，
+            -- 于是 respawn_at 残留、面板上停着一个永远不会到点的倒计时。
+            PersistBossRuntime(nil, {respawn_at = 0})
             print(" [定时启停]离开时间段，Boss 活动已结束。")
+        else
+            -- 服务器刚启动就已在时段外 / 反复 tick：保证倒计时不会残留
+            if tonumber(bossRuntimeState.respawnAt or 0) ~= 0 then
+                PersistBossRuntime(nil, {respawn_at = 0})
+            end
         end
     end
 
@@ -5444,6 +6184,9 @@ local function OnBossEnterCombat(event, creature, target)
         phase = 1,
         respawn_at = 0,
         last_engage_at = engageTime,
+        -- 进战采样一次，作为本场跨重启折算的基准
+        health_pct = SampleBossHealth(creature, false, false),
+        last_health_sample_at = engageTime,
     })
     InsertBossEvent(creature, "enter_combat", "Boss 进入战斗。", actorName, actorGuid, {
         target_name = actorName,
@@ -5451,12 +6194,9 @@ local function OnBossEnterCombat(event, creature, target)
     })
 end
 
--- 奖励函数（6 个独立奖池）
-local REWARD_POOL_BITS = {1, 2, 4, 8, 16, 32}
-
 -- 「职业奖励池」映射的反向索引：物品ID → { 可用职业ID = true }
 -- classFilter=true 的奖池用它做"这件奖品该职业能不能用"的权威判断（保留原有按职业分配奖品的逻辑）
-local function BuildClassItemIndex()
+BuildClassItemIndex = function()
     local index = {}
 
     for classId, items in pairs(CLASS_REWARD_ITEMS or {}) do
@@ -5479,20 +6219,30 @@ end
 --   1) 物品在「职业奖励池」映射里 → 以映射为准（映射存在时它就是权威，保证只发本职业装备）
 --   2) 不在映射里（坐骑/公式/通用物品）→ 问核心 Player:CanUseItem（含职业/种族/等级限制）
 --   3) 核心没给结论（老版本/异常）→ 按"无限制"处理，避免奖池整体发不出东西
-local function IsItemUsableByPlayer(itemId, player, classItemIndex)
+--   player = nil（离线补发）时用贡献记录里落下的 classId 做第 1 步；拿不到类目就只发通用物品。
+IsItemUsableByPlayer = function(itemId, player, classItemIndex, classId)
     local numericId = tonumber(itemId) or 0
-    if numericId <= 0 or not player then
+    if numericId <= 0 then
         return false
     end
 
     local mappedClasses = classItemIndex and classItemIndex[numericId]
     if mappedClasses then
-        local success, playerClass = pcall(function() return player:GetClass() end)
-        if not success or playerClass == nil then
-            return false
+        local resolvedClass = tonumber(classId) or 0
+        if player ~= nil then
+            local success, playerClass = pcall(function() return player:GetClass() end)
+            if not success or playerClass == nil then
+                return false
+            end
+            resolvedClass = tonumber(playerClass) or -1
         end
 
-        return mappedClasses[tonumber(playerClass) or -1] == true
+        return mappedClasses[resolvedClass] == true
+    end
+
+    if player == nil then
+        -- 离线：核心 CanUseItem 需要在线对象，通用物品按可用处理
+        return true
     end
 
     local success, usable = pcall(function() return player:CanUseItem(numericId) end)
@@ -5504,11 +6254,12 @@ local function IsItemUsableByPlayer(itemId, player, classItemIndex)
 end
 
 -- 从奖池里给某位获奖者挑 1 件他能用的物品；挑不出来返回 nil（宁可不发，也不发不能用的奖品）
-local function PickRewardPoolItemFor(pool, player, classItemIndex)
+-- player = nil 时（离线补发）按 record 里记下的职业过滤。
+PickRewardPoolItemFor = function(pool, player, classItemIndex, classId)
     local candidates = {}
 
     for _, itemId in ipairs(pool.items or {}) do
-        if (not pool.classFilter) or IsItemUsableByPlayer(itemId, player, classItemIndex) then
+        if (not pool.classFilter) or IsItemUsableByPlayer(itemId, player, classItemIndex, classId) then
             candidates[#candidates + 1] = itemId
         end
     end
@@ -5532,11 +6283,93 @@ local function GiveRewardItem(player, itemId, count, stepName, playerName)
     end
 end
 
+--  离线补发：击杀时已下线的贡献者用邮件收奖励（物品与金币都能寄 —— mod-ale 的全局
+--  SendMail 按 GUID 投递，玩家不在线也进邮箱）。职业过滤靠贡献记录里的 class_id
+--  （采样时玩家在线，那时把职业落库），拿不到就只发通用物品。
+SendOfflineRewardMail = function(record, bossName, poolName, itemId, goldCopper)
+    local guidLow = tonumber(record.guidLow or 0) or 0
+    if guidLow <= 0 then
+        print(string.format(" [奖励发放][%s] 离线补发失败：贡献记录里没有有效的 player_guid", tostring(record.name)))
+        return false
+    end
+
+    local subject = string.format("『%s』战利品", bossName)
+    local text = string.format("你参与了『%s』的战斗，获得奖池「%s」的奖励。", bossName, tostring(poolName))
+
+    local ok, err = pcall(function()
+        -- 61 = MAIL_STATIONERY_DEFAULT（与核心枚举一致）；senderGUIDLow=0 表示系统邮件
+        if itemId ~= nil and (tonumber(itemId) or 0) > 0 then
+            SendMail(subject, text, guidLow, 0, 61, 0,
+                tonumber(goldCopper) or 0, 0, tonumber(itemId), 1)
+        else
+            SendMail(subject, text, guidLow, 0, 61, 0,
+                tonumber(goldCopper) or 0, 0)
+        end
+    end)
+
+    if not ok then
+        print(string.format(" [奖励发放][%s] 离线补发失败：%s", tostring(record.name), tostring(err)))
+        return false
+    end
+
+    print(string.format(" [奖励发放][%s] 已按离线补发寄出（物品 %s，金币 %d 铜）",
+        tostring(record.name), tostring(itemId or "-"), tonumber(goldCopper) or 0))
+    return true
+end
+
+-- 金币：`Player:ModifyMoney` 在 mod-ale 里**没有返回值**（C++ 侧 `return 1` 但没有 Push，
+-- Lua 拿到 nil），所以按 `GetCoinage()` 前后差判定；拿不到钱数（桩环境/老版本）时
+-- 按"已下发"处理并只记日志，绝不像旧版那样把恒真的闭包当成功。
+GiveRewardGold = function(player, amount, stepName, playerName)
+    local copper = math.floor(tonumber(amount) or 0)
+    if copper <= 0 then
+        return true, 0
+    end
+
+    local coinageBefore = nil
+    local okBefore, before = pcall(function() return player:GetCoinage() end)
+    if okBefore then
+        coinageBefore = tonumber(before)
+    end
+
+    local ok, err = pcall(function() player:ModifyMoney(copper) end)
+    if not ok then
+        print(string.format(" [奖励发放][%s] %s金币发放失败：%s", playerName, stepName, tostring(err)))
+        return false, 0
+    end
+
+    if coinageBefore == nil then
+        print(string.format(" [奖励发放][%s] %s金币=%d 铜（回读不到钱数，按已下发处理）",
+            playerName, stepName, copper))
+        return true, copper
+    end
+
+    local okAfter, after = pcall(function() return player:GetCoinage() end)
+    local coinageAfter = okAfter and tonumber(after) or nil
+    if coinageAfter == nil or coinageAfter <= coinageBefore then
+        print(string.format(" [奖励发放][%s] %s金币发放失败：钱数没有增加（%s → %s）",
+            playerName, stepName, tostring(coinageBefore), tostring(coinageAfter)))
+        return false, 0
+    end
+
+    local granted = coinageAfter - coinageBefore
+    if granted < copper then
+        print(string.format(" [奖励发放][%s] %s金币部分到账：%d/%d 铜（达到携带上限）",
+            playerName, stepName, granted, copper))
+    end
+
+    return true, granted
+end
+
+--  结算流程切成三段，任一段抛错都不影响收尾：
+--    A 落库准备：贡献池 + 贡献榜日志 + death 事件
+--    B 发奖：奖池掷骰 → 选人 → 发物品/金币（离线的走邮件）→ 世界通告
+--    C 收尾（Finalize）：奖励标记、贡献快照、状态清理、重生排程 —— 无论 A/B 成败必然执行
+--  为什么必须这样切：旧版把"已奖励"标记放在最前面、把清理与重生排在函数尾部，
+--  中间任何一步抛错都会造成「无快照、不重生、该 GUID 永久跳过」。
 local function OnBossDied(event, creature, killer)
-    local rewardedPlayers = {}
-    
     if not creature or not creature:GetGUIDLow() then return end
-    
+
     local guid = creature:GetGUIDLow()
     local bossName = ResolveBossCandidateName(creature:GetEntry(), creature:GetName())
     print(" [调试信息]Boss死亡，GUID: " .. guid .. ", 名称: " .. bossName)
@@ -5545,202 +6378,290 @@ local function OnBossDied(event, creature, killer)
         print(" [调试信息]Boss已经被奖励过了，跳过")
         return
     end
-    
+
     if not scriptSpawnedBossGUIDs[guid] then
         print(" [奖励发放]错误: Boss不在脚本生成列表中，GUID=" .. guid)
         return
     end
-    
-    bossRewardedGUIDs[guid] = true
+
     local deathTime = BossNow()
     local bossContext = ResolveBossContext(creature)
     local guaranteedRewardKeys = {}
     local randomRewardKeys = {}
-    
+    local poolMasks = {}          -- 贡献身份 → 中奖位图
+    local winnersByPool = {}      -- pool_id → { 玩家名... }
+    local poolResults = {}        -- 写进事件 payload，便于审计
+    local contributors = {}       -- { player = 可能为 nil, score, record }
+    local contributionState = nil
+    local deathActorName = ""
+    local deathActorGuid = 0
+    local totalFailed = 0
+    local classItemIndex = BuildClassItemIndex()
+
+    local Finalize
+
+    local function TraceError(message)
+        local trace = debug and debug.traceback and debug.traceback() or ""
+        return tostring(message) .. "\n" .. tostring(trace)
+    end
+
     print(" [奖励发放]========== 开始奖励发放流程 ==========")
     print(" [奖励发放]Boss名称: " .. bossName)
     print(" [奖励发放]Boss GUID: " .. guid)
-    
-    local contributorPool, contributionState = BuildContributorRewardPool(guid, killer)
-    local playersList = {}
-    if #contributorPool > 0 then
-        print(" [奖励发放]贡献池玩家数量: " .. #contributorPool)
-        for index, entry in ipairs(contributorPool) do
-            table.insert(playersList, entry.player)
-            local record = entry.record
-            print(string.format(
-                " [奖励发放][贡献榜%02d] %s 分数=%.2f 输出=%d 治疗=%d 仇恨样本=%d 在场样本=%d%s",
-                index,
-                record.name,
-                entry.score,
-                record.damageDone,
-                record.healingDone,
-                record.threatSamples,
-                record.presenceSamples,
-                record.isKiller and " 最后一击" or ""))
-        end
-    else
-        print(" [奖励发放]警告: 未建立有效贡献池，回退到仇恨快照逻辑")
 
-        local playerSet = {}
-        local threatSnapshot = bossThreatSnapshots[guid]
-        if threatSnapshot then
-            for _, snapshotEntry in ipairs(threatSnapshot) do
-                if snapshotEntry.isPlayer and snapshotEntry.guid then
-                    local player = SafeGetPlayerByGUID(snapshotEntry.guid)
-                    if player then
-                        local guidKey = tostring(snapshotEntry.guid)
-                        if not playerSet[guidKey] then
-                            playerSet[guidKey] = true
-                            table.insert(playersList, player)
-                        end
+    local ok, err = xpcall(function()
+        contributors, contributionState = BuildContributorRewardPool(guid, killer)
+
+        if #contributors > 0 then
+            print(" [奖励发放]有效参战人数: " .. #contributors)
+            for index, entry in ipairs(contributors) do
+                local record = entry.record
+                print(string.format(
+                    " [奖励发放][贡献榜%02d] %s 分数=%.2f 输出=%d 治疗=%d 仇恨样本=%d 在场样本=%d%s%s",
+                    index,
+                    tostring(record.name or "?"),
+                    entry.score,
+                    record.damageDone or 0,
+                    record.healingDone or 0,
+                    record.threatSamples or 0,
+                    record.presenceSamples or 0,
+                    record.isKiller and " 最后一击" or "",
+                    entry.player == nil and "（已离线，走邮件补发）" or ""))
+            end
+        else
+            -- 贡献状态丢失（脚本热更等）时的兜底：按仇恨快照 + 最后一击凑名单，
+            -- 只可能拿到在线玩家（离线玩家的记录已经无处可查）。
+            print(" [奖励发放]警告: 未建立有效贡献池，回退到仇恨快照逻辑")
+
+            local seenFallback = {}
+            local function AddFallbackPlayer(player)
+                if not IsUnitValid(player) then return end
+
+                local key = GetContributionIdentity(player)
+                if seenFallback[key] then return end
+                seenFallback[key] = true
+
+                local classId = 0
+                pcall(function() classId = tonumber(player:GetClass() or 0) or 0 end)
+                local record = {
+                    key = key,
+                    guidLow = SafeGetGuidLow(player),
+                    name = SafeGetUnitName(player),
+                    classId = classId,
+                    damageDone = 0,
+                    healingDone = 0,
+                    threatSamples = 0,
+                    presenceSamples = 0,
+                    isKiller = false,
+                }
+                contributors[#contributors + 1] = {player = player, score = 1, record = record}
+            end
+
+            local threatSnapshot = bossThreatSnapshots[guid]
+            if threatSnapshot then
+                for _, snapshotEntry in ipairs(threatSnapshot) do
+                    if snapshotEntry.isPlayer and snapshotEntry.guid then
+                        AddFallbackPlayer(SafeGetPlayerByGUID(snapshotEntry.guid))
                     end
                 end
             end
+
+            AddFallbackPlayer(ResolvePlayerContributor(killer))
         end
 
-        local killerPlayer = ResolvePlayerContributor(killer)
-        if killerPlayer then
-            local _, killerGuidObj = pcall(function() return killerPlayer:GetGUID() end)
-            local killerGuid = tostring(killerGuidObj or killerPlayer:GetGUIDLow())
-            if not playerSet[killerGuid] then
-                playerSet[killerGuid] = true
-                table.insert(playersList, killerPlayer)
+        local eligiblePlayerCount = #contributors
+        print(" [奖励发放]符合条件的玩家总数: " .. eligiblePlayerCount)
+
+        -- 配置体检：count 模式下名额 ≥ 参战人数时，该池本次必然发成"全体"（与 all 模式等价）。
+        -- 这里显式标警，避免配置写错（例如参战 6 人却填了 9 人）却毫无提示。
+        for _, pool in ipairs(REWARD_POOLS) do
+            if pool.enabled then
+                local winnerCountConfig = tonumber(pool.winnerCount) or 0
+                local degenerateAll = pool.winnerMode ~= "all"
+                    and eligiblePlayerCount > 0
+                    and winnerCountConfig >= eligiblePlayerCount
+                print(string.format(" [奖励发放]奖池%d[%s]: 概率=%d%% 获奖人数=%s 职业过滤=%s 奖品=%d件 金币=%d-%d%s",
+                    pool.poolId,
+                    pool.name,
+                    pool.chance,
+                    pool.winnerMode == "all" and "全部有效参战" or (tostring(pool.winnerCount) .. "人"),
+                    pool.classFilter and "开" or "关",
+                    #(pool.items or {}),
+                    tonumber(pool.goldMinCopper) or 0,
+                    tonumber(pool.goldMaxCopper) or 0,
+                    degenerateAll and string.format(" ⚠名额%d≥有效参战%d人，将按全体发放",
+                        winnerCountConfig, eligiblePlayerCount) or ""))
             end
         end
-    end
 
-    print(" [奖励发放]符合条件的玩家总数: " .. #playersList)
-    local eligiblePlayerCount = #playersList
-    for index = 1, REWARD_POOL_COUNT do
-        local pool = REWARD_POOLS[index]
-        if pool and pool.enabled then
-            -- 配置体检：count 模式下名额 ≥ 参战人数时，该池本次必然发成"全体"（与 all 模式等价）。
-            -- 这里显式标警，避免配置写错（例如参战 6 人却填了 9 人）却毫无提示。
-            local winnerCountConfig = tonumber(pool.winnerCount) or 0
-            local degenerateAll = pool.winnerMode ~= "all"
-                and eligiblePlayerCount > 0
-                and winnerCountConfig >= eligiblePlayerCount
-            print(string.format(" [奖励发放]奖池%d: 概率=%d%% 获奖人数=%s 职业过滤=%s 奖品=%d件%s",
-                index,
-                pool.chance,
-                pool.winnerMode == "all" and "全部有效参战" or (tostring(pool.winnerCount) .. "人"),
-                pool.classFilter and "开" or "关",
-                #(pool.items or {}),
-                degenerateAll and string.format(" ⚠名额%d≥有效参战%d人，将按全体发放",
-                    winnerCountConfig, eligiblePlayerCount) or ""))
+        local deathKillerPlayer = ResolvePlayerContributor(killer)
+        deathActorName = deathKillerPlayer and SafeGetUnitName(deathKillerPlayer) or ""
+        deathActorGuid = deathKillerPlayer and SafeGetGuidLow(deathKillerPlayer) or 0
+        InsertBossEvent(creature, "death", "Boss 已被击杀。", deathActorName, deathActorGuid, {
+            eligible_players = eligiblePlayerCount,
+        })
+
+        -- ========== 奖池结算 ==========
+        if eligiblePlayerCount == 0 then
+            print(" [奖励发放]没有玩家符合奖励条件，跳过奖励发放")
+            SendWorldMessage("『" .. bossName .. "』已被击败，但没有玩家符合奖励条件。")
+            return
         end
-    end
 
-    local deathKillerPlayer = ResolvePlayerContributor(killer)
-    local deathActorName = deathKillerPlayer and SafeGetUnitName(deathKillerPlayer) or ""
-    local deathActorGuid = deathKillerPlayer and SafeGetGuidLow(deathKillerPlayer) or 0
-    InsertBossEvent(creature, "death", "Boss 已被击杀。", deathActorName, deathActorGuid, {
-        eligible_players = #playersList,
-    })
+        for _, pool in ipairs(REWARD_POOLS) do
+            local result = {
+                pool_id = pool.poolId,
+                name = pool.name,
+                enabled = pool.enabled == true,
+                triggered = false,
+                winners = 0,
+                items = #(pool.items or {}),
+                gold_total = 0,
+                failed = 0,
+                mailed = 0,
+                degenerate_all = false,
+            }
+            poolResults[#poolResults + 1] = result
 
-    -- ========== 6 个独立奖池 ==========
-    local poolMasks = {}          -- 贡献身份 → 中奖位图
-    local winnersByPool = {}      -- 奖池序号 → { 玩家名... }
-    local poolResults = {}        -- 写进死亡事件 payload，便于审计
-
-    if #playersList == 0 then
-        print(" [奖励发放]没有玩家符合奖励条件，跳过奖励发放")
-        SendWorldMessage("『" .. bossName .. "』已被击败，但没有玩家符合奖励条件。")
-    else
-        local classItemIndex = BuildClassItemIndex()
-
-        for index = 1, REWARD_POOL_COUNT do
-            local pool = REWARD_POOLS[index]
-            local result = { index = index, enabled = false, triggered = false, winners = 0, items = 0 }
-
-            if pool and pool.enabled then
-                result.enabled = true
-                result.items = #(pool.items or {})
-
-                if result.items == 0 then
-                    print(string.format(" [奖励发放]奖池%d: 已开启但没有奖品，跳过", index))
+            if pool.enabled then
+                local goldMax = math.max(0, tonumber(pool.goldMaxCopper) or 0)
+                if result.items == 0 and goldMax <= 0 then
+                    -- 空池（既没物品也没金币）：跳过并打日志，不影响其它池
+                    print(string.format(" [奖励发放]奖池%d[%s]: 已开启但既没有奖品也没有金币，跳过",
+                        pool.poolId, pool.name))
                 else
                     local roll = math.random(100)
                     result.triggered = roll <= pool.chance
-                    print(string.format(" [奖励发放]奖池%d: 触发判定 随机数=%d 需要<=%d → %s",
-                        index, roll, pool.chance, result.triggered and "命中" or "未命中"))
+                    print(string.format(" [奖励发放]奖池%d[%s]: 触发判定 随机数=%d 需要<=%d → %s",
+                        pool.poolId, pool.name, roll, pool.chance, result.triggered and "命中" or "未命中"))
 
                     if result.triggered then
-                        -- 1) 定获奖名单
+                        -- 1) 定获奖名单（候选可能包含已离线者，由 record 承载）
                         local recipients = {}
                         if pool.winnerMode == "all" then
-                            recipients = playersList
+                            recipients = contributors
                         else
-                            local selectionPool = contributorPool
-                            if #selectionPool == 0 then
-                                selectionPool = {}
-                                for _, player in ipairs(playersList) do
-                                    table.insert(selectionPool, {
-                                        player = player,
-                                        score = 1,
-                                        record = {name = SafeGetUnitName(player)},
-                                    })
-                                end
-                            end
-
                             -- 保护：抽签名额上限 = 实际候选人数（正常等于有效参战人数）。
                             -- winnerCount 配大了不会报错，只会静默发成"全体"，所以这里显式截断并告警，
                             -- 让 boss.log 能看出是配置问题而不是抽签运气。
                             result.requested_winners = pool.winnerCount
-                            local limit = math.min(pool.winnerCount, #selectionPool)
-                            if pool.winnerCount >= #selectionPool then
+                            local limit = math.min(pool.winnerCount, #contributors)
+                            if pool.winnerCount >= #contributors then
                                 result.degenerate_all = true
                                 print(string.format(
-                                    " [奖励发放]奖池%d: 名额配置=%d ≥ 候选人数=%d，本次按全体发放（建议把该池获奖人数改小）",
-                                    index, pool.winnerCount, #selectionPool))
+                                    " [奖励发放]奖池%d[%s]: 名额配置=%d ≥ 候选人数=%d，本次按全体发放（建议把该池获奖人数改小）",
+                                    pool.poolId, pool.name, pool.winnerCount, #contributors))
                             end
 
-                            for _, entry in ipairs(SelectWeightedRewardWinners(selectionPool, limit)) do
-                                recipients[#recipients + 1] = entry.player
-                            end
+                            recipients = SelectWeightedRewardWinners(contributors, limit)
                         end
 
-                        -- 2) 每人 1 件"他能用"的奖品
-                        for _, player in ipairs(recipients) do
-                            local playerName = SafeGetUnitName(player)
-                            local itemId = PickRewardPoolItemFor(pool, player, classItemIndex)
-                            if not itemId then
-                                print(string.format(
-                                    " [奖励发放]奖池%d[%s]: 池内没有该玩家能用的奖品（职业过滤=%s），本次跳过",
-                                    index, playerName, pool.classFilter and "开" or "关"))
+                        -- 2) 每人每池 1 件"他能用"的奖品 + 池内金币；离线走邮件
+                        for _, entry in ipairs(recipients) do
+                            local record = entry.record
+                            local player = entry.player
+                            local playerName = tostring(record.name or "")
+                            if playerName == "" then
+                                playerName = SafeGetUnitName(player)
+                            end
+
+                            local itemId = nil
+                            if result.items > 0 then
+                                -- player = nil（离线）时按记录里的 class_id 过滤，见 IsItemUsableByPlayer
+                                itemId = PickRewardPoolItemFor(pool, player, classItemIndex, record.classId)
+
+                                if itemId == nil then
+                                    print(string.format(
+                                        " [奖励发放]奖池%d[%s][%s]: 池内没有该玩家能用的奖品（职业过滤=%s），本次跳过",
+                                        pool.poolId, pool.name, playerName, pool.classFilter and "开" or "关"))
+                                end
+                            end
+
+                            local gold = 0
+                            local goldMin = math.max(0, tonumber(pool.goldMinCopper) or 0)
+                            if goldMax > 0 then
+                                gold = (goldMin >= goldMax) and goldMin or math.random(goldMin, goldMax)
+                            end
+
+                            local wantsReward = itemId ~= nil or gold > 0
+                            if not wantsReward then
+                                -- 该池对这个玩家没有可发的东西（空池已在上层拦住，这里是"池内没有他能用的奖品"）
+                                result.failed = result.failed + 1
                             else
-                                if GiveRewardItem(player, itemId, 1, "奖池" .. index, playerName) then
+                                local delivered = false
+                                local goldGranted = 0
+
+                                if player ~= nil then
+                                    local itemOk = true
+                                    if itemId ~= nil then
+                                        itemOk = GiveRewardItem(player, itemId, 1,
+                                            "奖池" .. pool.poolId .. "[" .. pool.name .. "]", playerName)
+                                    end
+
+                                    local goldOk
+                                    goldOk, goldGranted = GiveRewardGold(player, gold,
+                                        "奖池" .. pool.poolId .. "[" .. pool.name .. "]", playerName)
+                                    if goldOk ~= true then
+                                        goldGranted = 0
+                                    end
+
+                                    -- 两条通道只要有一条落地就算发成功（另一条失败已各自打日志），
+                                    -- 都失败才计入 failed，避免"物品给了却记成失败、位图漏记"。
+                                    delivered = ((itemId ~= nil) and itemOk) or goldGranted > 0
+                                    if delivered then
+                                        local goldText = ""
+                                        if goldGranted > 0 then
+                                            goldText = string.format("（%d 金 %d 银 %d 铜）",
+                                                math.floor(goldGranted / 10000),
+                                                math.floor((goldGranted % 10000) / 100),
+                                                goldGranted % 100)
+                                        end
+                                        player:SendBroadcastMessage(string.format(
+                                            "你参与了『%s』的战斗，获得奖池「%s」的奖励%s%s！",
+                                            bossName, pool.name,
+                                            itemId ~= nil and ("（物品ID " .. tostring(itemId) .. "）") or "",
+                                            goldText))
+                                    end
+
+                                    result.gold_total = result.gold_total + goldGranted
+                                elseif BOSS_CONFIG.offlineRewardDelivery == true then
+                                    delivered = SendOfflineRewardMail(record, bossName, pool.name, itemId, gold)
+                                    if delivered then
+                                        result.mailed = result.mailed + 1
+                                        result.gold_total = result.gold_total + gold
+                                    end
+                                else
+                                    print(string.format(
+                                        " [奖励发放]奖池%d[%s][%s]: 玩家已离线且未开启离线补发，本次跳过",
+                                        pool.poolId, pool.name, playerName))
+                                end
+
+                                if delivered then
                                     result.winners = result.winners + 1
-                                    local rewardKey = GetContributionIdentity(player)
-                                    poolMasks[rewardKey] = (poolMasks[rewardKey] or 0) + (REWARD_POOL_BITS[index] or 0)
+                                    local rewardKey = record.key
+                                    poolMasks[rewardKey] = (poolMasks[rewardKey] or 0) + GetRewardPoolMask(pool.poolId)
                                     randomRewardKeys[rewardKey] = true
                                     if pool.winnerMode == "all" then
                                         guaranteedRewardKeys[rewardKey] = true
                                     end
 
-                                    winnersByPool[index] = winnersByPool[index] or {}
-                                    table.insert(winnersByPool[index], playerName)
-                                    player:SendBroadcastMessage(string.format(
-                                        "你参与了『%s』的战斗，获得奖池%d的奖品（物品ID %d）！",
-                                        bossName, index, itemId))
-                                    table.insert(rewardedPlayers, playerName)
+                                    winnersByPool[pool.poolId] = winnersByPool[pool.poolId] or {}
+                                    table.insert(winnersByPool[pool.poolId], playerName)
+                                else
+                                    result.failed = result.failed + 1
                                 end
                             end
                         end
                     end
                 end
             end
-
-            poolResults[#poolResults + 1] = result
         end
 
-        -- 3) 世界通告：按奖池汇报获奖玩家
         local announceParts = {}
-        for index = 1, REWARD_POOL_COUNT do
-            local names = winnersByPool[index]
-            if names and #names > 0 then
-                table.insert(announceParts, string.format("奖池%d：%s", index, table.concat(names, "、")))
+        for _, pool in ipairs(REWARD_POOLS) do
+            local names = winnersByPool[pool.poolId]
+            if pool.announce ~= false and names and #names > 0 then
+                table.insert(announceParts, string.format("%s：%s", pool.name, table.concat(names, "、")))
             end
         end
 
@@ -5750,37 +6671,72 @@ local function OnBossDied(event, creature, killer)
         else
             print(" [奖励发放]本轮没有任何奖池发放成功")
         end
+    end, TraceError)
+
+    if not ok then
+        print(" [奖励发放]结算过程出错，已按兜底路径收尾：" .. tostring(err))
+        InsertBossEvent(creature, "reward_failed", "奖池结算过程出错，已按兜底路径收尾（快照与重生照常）。", "", 0, {
+            error = tostring(err),
+        })
     end
 
-    InsertBossEvent(creature, "reward_granted", "奖池结算完成。", deathActorName, deathActorGuid, {
-        pools = poolResults,
-        winners_by_pool = winnersByPool,
-    })
+    for _, result in ipairs(poolResults) do
+        totalFailed = totalFailed + (tonumber(result.failed) or 0)
+    end
 
-    bossRuntimeState.lastDeathAt = deathTime
-    PersistBossContributorSnapshots(
-        bossContext,
-        contributionState or bossContributionStats[guid],
-        randomRewardKeys,
-        guaranteedRewardKeys,
-        poolMasks,
-        deathTime
-    )
+    Finalize = function()
+        if bossRewardedGUIDs[guid] then
+            return
+        end
+        bossRewardedGUIDs[guid] = true
 
-    -- 清理
-    if creature.RemoveEvents then creature:RemoveEvents() end
-    bossAIStates[guid] = nil
-    bossAllySpawned[guid] = nil
-    bossTraitsApplied[guid] = nil
-    bossBaseMaxHealth[guid] = nil
-    bossAppliedAuras[guid] = nil
-    bossRewardedGUIDs[guid] = nil
-    if currentActiveBossGUID == guid then ClearActiveBoss() end
-    scriptSpawnedBossGUIDs[guid] = nil
-    bossThreatSnapshots[guid] = nil
-    bossContributionStats[guid] = nil
+        InsertBossEvent(creature, "reward_granted", "奖池结算完成。", deathActorName, deathActorGuid, {
+            pools = poolResults,
+            winners_by_pool = winnersByPool,
+            failed = totalFailed,
+        })
 
-    ScheduleBossRespawn(creature:GetInstanceId(), bossContext)
+        bossRuntimeState.lastDeathAt = deathTime
+
+        -- 快照写失败不能挡住清理与重生排程（两者是不同层面的失败）
+        local snapshotOk, snapshotErr = pcall(function()
+            PersistBossContributorSnapshots(
+                bossContext,
+                contributionState or bossContributionStats[guid],
+                randomRewardKeys,
+                guaranteedRewardKeys,
+                poolMasks,
+                deathTime
+            )
+        end)
+        if not snapshotOk then
+            BossSql.record("写贡献快照", tostring(snapshotErr))
+        end
+
+        -- 清理
+        if creature.RemoveEvents then creature:RemoveEvents() end
+        bossAIStates[guid] = nil
+        bossAllySpawned[guid] = nil
+        bossTraitsApplied[guid] = nil
+        bossBaseMaxHealth[guid] = nil
+        bossAppliedAuras[guid] = nil
+        bossRewardedGUIDs[guid] = nil
+        if currentActiveBossGUID == guid then ClearActiveBoss() end
+        scriptSpawnedBossGUIDs[guid] = nil
+        bossThreatSnapshots[guid] = nil
+        bossContributionStats[guid] = nil
+
+        ScheduleBossRespawn(creature:GetInstanceId(), bossContext)
+    end
+
+    local finalizeOk, finalizeErr = xpcall(Finalize, TraceError)
+    if not finalizeOk then
+        print(" [奖励发放]收尾阶段出错：" .. tostring(finalizeErr))
+        -- 收尾失败也要保证排到重生，否则这只 Boss 从此不再出现
+        pcall(function()
+            ScheduleBossRespawn(creature:GetInstanceId(), bossContext)
+        end)
+    end
 end
 
 local function OnBossLeaveCombat(event, creature)
@@ -5797,6 +6753,9 @@ local function OnBossLeaveCombat(event, creature)
             status = "spawned",
             phase = 1,
             last_reset_at = resetTime,
+            -- 脱战也要留一份血量（下一次重启按这个百分比折算）
+            health_pct = SampleBossHealth(creature, false, false),
+            last_health_sample_at = resetTime,
         })
         InsertBossEvent(creature, "leave_combat", "Boss 已脱离战斗。", "", 0, {})
     end
@@ -5893,6 +6852,7 @@ local function OnBossCommand(event, player, command, chatHandler)
         BossSendMessage(player, chatHandler, "13. .boss spawn force 定时计划在时段外时强制生成一只（调试用）。")
         BossSendMessage(player, chatHandler, "14. .boss preset random on|off 开启/关闭「每次刷新随机选一套技能预设」。")
         BossSendMessage(player, chatHandler, "15. .boss preset pool <key,key>|all 设置随机池（all = 全部预设；与面板「扩展配置 → 技能池随机」同源）。")
+        BossSendMessage(player, chatHandler, "16. .boss pools 查看当前生效的奖池（来源 " .. BOSS_REWARD_POOL_TABLE .. " 表或代码默认）。")
         BossSendMessage(player, chatHandler, "当前Boss: " .. tostring(BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].name or "")
             .. " (Entry " .. tostring(BOSS_CANDIDATES[1] and BOSS_CANDIDATES[1].entry or 0) .. ")")
         BossSendMessage(player, chatHandler, "当前技能池: " .. GetCurrentSkillPresetLabel())
@@ -5900,6 +6860,38 @@ local function OnBossCommand(event, player, command, chatHandler)
             BOSS_CONFIG.skillPresetRandomEnabled == true and "已开启" or "已关闭",
             table.concat(GetEffectiveSkillPresetPool(), ", ")))
         BossSendMessage(player, chatHandler, "当前强度: " .. GetCurrentSkillDifficultyLabel())
+        BossSendMessage(player, chatHandler, "当前奖池: " .. #REWARD_POOLS .. " 个（来源 "
+            .. tostring(REWARD_POOLS_SOURCE) .. "），写库失败: " .. DescribeBossSqlFailures())
+        return false
+    end
+
+    if action == "pools" then
+        -- 奖池的权威来源是表：这里列出运行期真正生效的那份（含来源与位号）
+        BossReply(player, chatHandler, true, string.format("当前奖池 %d 个（来源: %s%s）：",
+            #REWARD_POOLS,
+            tostring(REWARD_POOLS_SOURCE),
+            REWARD_POOLS_SOURCE == "code" and "，表里没有本区数据" or ""))
+        local enabledCount = 0
+        for _, pool in ipairs(REWARD_POOLS) do
+            if pool.enabled then
+                enabledCount = enabledCount + 1
+            end
+            BossSendMessage(player, chatHandler, string.format(
+                "  #%d %s [%s] 概率=%d%% 人数=%s 职业过滤=%s 奖品=%d件 金币=%d-%d 公告=%s",
+                pool.poolId,
+                pool.name,
+                pool.enabled and "开" or "关",
+                pool.chance,
+                pool.winnerMode == "all" and "全部有效参战" or (tostring(pool.winnerCount) .. "人"),
+                pool.classFilter and "开" or "关",
+                #(pool.items or {}),
+                tonumber(pool.goldMinCopper) or 0,
+                tonumber(pool.goldMaxCopper) or 0,
+                pool.announce ~= false and "是" or "否"))
+        end
+        BossSendMessage(player, chatHandler, string.format("启用 %d / 共 %d。位号 = 贡献位图第 (位号-1) 位；最多 %d 个池。",
+            enabledCount, #REWARD_POOLS, BOSS_MAX_REWARD_POOLS))
+        BossSendMessage(player, chatHandler, "维护入口：AGMP 面板「奖池」，或 sql/" .. BOSS_REWARD_POOL_TABLE .. " 表；改完 `.boss config reload` 即时生效。")
         return false
     end
 
@@ -5938,9 +6930,13 @@ local function OnBossCommand(event, player, command, chatHandler)
             boss_name = BOSS_CANDIDATES[1] and tostring(BOSS_CANDIDATES[1].name or "") or "",
             skill_preset = ACTIVE_SKILL_PRESET_KEY or BOSS_CONFIG.skillPreset,
             skill_difficulty = ACTIVE_SKILL_DIFFICULTY_KEY or BOSS_CONFIG.skillDifficulty,
+            reward_pools = #REWARD_POOLS,
+            reward_pools_source = tostring(REWARD_POOLS_SOURCE),
         })
 
-        BossReply(player, chatHandler, true, "Boss 配置已从 " .. BOSS_DB_NAME .. " 热加载。")
+        BossReply(player, chatHandler, true, string.format("Boss 配置已从 %s 热加载（奖池 %d 个，来源 %s）。",
+            BOSS_DB_NAME, #REWARD_POOLS, tostring(REWARD_POOLS_SOURCE)))
+        BossSendMessage(player, chatHandler, "写库失败: " .. DescribeBossSqlFailures())
         local configuredEntry = BOSS_CANDIDATES[1] and tonumber(BOSS_CANDIDATES[1].entry or 0) or 0
         if configuredEntry > 0 and previousEntry > 0 and configuredEntry ~= previousEntry then
             BossSendMessage(player, chatHandler, string.format(
@@ -6020,11 +7016,15 @@ local function OnBossCommand(event, player, command, chatHandler)
             end
 
             if changed then
-                PersistBossConfigToDB(false)
+                local wrote = PersistBossConfigToDB(false)
                 InsertBossEvent(activeBossCreature, "command_preset_random", "技能池随机配置已更新。", actorName, actorGuid, {
                     enabled = BOSS_CONFIG.skillPresetRandomEnabled == true,
                     pool = BOSS_CONFIG.skillPresetPoolText or "",
+                    persisted = wrote and 1 or 0,
                 })
+                if not wrote then
+                    BossSendMessage(player, chatHandler, "⚠ 写入数据库失败，本次改动只对当前进程生效（见 boss.log）。")
+                end
             end
 
             BossReply(player, chatHandler, true, string.format(
@@ -6057,15 +7057,19 @@ local function OnBossCommand(event, player, command, chatHandler)
         local resolvedKey, preset = ApplySkillPreset(parts[3])
         BOSS_CONFIG.skillPreset = resolvedKey
         activeBossSkillPresetKey = resolvedKey
-        PersistBossConfigToDB(false)
+        local presetWrote = PersistBossConfigToDB(false)
         PersistBossRuntime(activeBossCreature, {})
         InsertBossEvent(activeBossCreature, "command_preset", "技能预设已切换。", actorName, actorGuid, {
             preset = resolvedKey,
+            persisted = presetWrote and 1 or 0,
         })
         BossReply(player, chatHandler, true, "技能池已切换为 " .. resolvedKey .. "（" .. preset.displayName .. "）。")
         if player ~= nil then
             BossSendMessage(player, chatHandler, "说明: " .. preset.summary)
             BossSendMessage(player, chatHandler, "当前强度档位: " .. GetCurrentSkillDifficultyLabel())
+            if not presetWrote then
+                BossSendMessage(player, chatHandler, "⚠ 写入数据库失败，本次改动只对当前进程生效（见 boss.log）。")
+            end
         end
         return false
     end
@@ -6084,15 +7088,19 @@ local function OnBossCommand(event, player, command, chatHandler)
 
         local _, _, resolvedDifficultyKey, difficulty = ApplySkillDifficulty(parts[3])
         BOSS_CONFIG.skillDifficulty = resolvedDifficultyKey
-        PersistBossConfigToDB(false)
+        local difficultyWrote = PersistBossConfigToDB(false)
         PersistBossRuntime(activeBossCreature, {})
         InsertBossEvent(activeBossCreature, "command_difficulty", "技能强度已切换。", actorName, actorGuid, {
             difficulty = resolvedDifficultyKey,
+            persisted = difficultyWrote and 1 or 0,
         })
         BossReply(player, chatHandler, true, "技能强度已切换为 " .. resolvedDifficultyKey .. "（" .. difficulty.displayName .. "）。")
         if player ~= nil then
             BossSendMessage(player, chatHandler, "说明: " .. difficulty.summary)
             BossSendMessage(player, chatHandler, "当前技能池预设: " .. GetCurrentSkillPresetLabel())
+            if not difficultyWrote then
+                BossSendMessage(player, chatHandler, "⚠ 写入数据库失败，本次改动只对当前进程生效（见 boss.log）。")
+            end
         end
         return false
     end
@@ -6188,7 +7196,7 @@ local function OnBossCommand(event, player, command, chatHandler)
     end
 
     if action ~= nil and action ~= "" and action ~= "spawn" then
-        BossReply(player, chatHandler, false, "未知的 .boss 子命令（可用: spawn / help / config reload / config show / preset [list|random|pool] / difficulty / rebase / kill / clear / schedule）。")
+        BossReply(player, chatHandler, false, "未知的 .boss 子命令（可用: spawn / help / config reload / config show / pools / preset [list|random|pool] / difficulty / rebase / kill / clear / schedule）。")
         return false
     end
 
@@ -6220,7 +7228,8 @@ local function OnBossCommand(event, player, command, chatHandler)
     local boss = nil
     local bossName = nil
     if player == nil then
-        boss = SpawnRandomBoss(0)
+        -- 控制台的 `.boss spawn force` 同样要能穿透时段闸门
+        boss = SpawnRandomBoss(0, parts[3] == "force")
         if boss then
             bossName = SafeGetUnitName(boss)
             InsertBossEvent(boss, "command_spawn", "控制台命令生成 Boss。", actorName, actorGuid, {
@@ -6249,6 +7258,10 @@ local function OnBossCommand(event, player, command, chatHandler)
                 phase = 1,
                 respawn_at = 0,
                 last_spawn_at = BossNow(),
+                -- GM 在当前位置生成：没有刷新点序号（重启后按 home_* 坐标就近匹配），血量视为满血
+                spawn_point_index = -1,
+                health_pct = 100,
+                last_health_sample_at = BossNow(),
             })
             InsertBossEvent(boss, "command_spawn", "GM 命令在当前位置生成 Boss。", actorName, actorGuid, {
                 spawn_source = "player",

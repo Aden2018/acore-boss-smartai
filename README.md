@@ -6,14 +6,17 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 
 - Smart combat AI with multiple skill presets and difficulty modes.
 - **Random skill preset**: when enabled, every spawn/respawn draws one preset from the pool ticked in the panel (AGMP → Extended config → Random skill preset); see [Random skill preset](#random-skill-preset).
-- **Six independent reward pools**: enable switch / chance / winner count (every eligible player or a fixed number) / prize item list,
-  each configured on its own; the panel takes item IDs and shows the resolved item names, and prizes are
-  filtered per class so nobody is handed gear they cannot use (see [Rewards: six independent pools](#rewards-six-independent-pools)).
+- **Reward pools as a table (any number of pools)**: pools live in `boss_reward_pools` — enable switch / chance / winner count
+  (every eligible player or a fixed number) / prize list / **gold range**, each configured on its own, added and removed freely
+  (bit numbers are never reused). The panel takes item IDs and shows the resolved item names, prizes are filtered per class so
+  nobody is handed gear they cannot use, and participants who logged off before the kill are paid by mail (see [Rewards: a pool table](#rewards-a-pool-table-with-any-number-of-pools)).
 - **Selectable power tiers** backed by dedicated `creature_template` entries (see [Difficulty tiers](#difficulty-tiers)).
 - **Daily schedule**: start and stop the activity automatically by time windows (AGMP → Extended config → Schedule); see [Daily schedule](#daily-schedule).
+- **Survives a worldserver restart**: the encounter is rebuilt at the recorded spawn point with the recorded skill preset and the
+  pre-restart health percentage (see [Surviving a worldserver restart](#surviving-a-worldserver-restart)).
 - **All settings live in the database**: the script only ships defaults, the running config comes from `ac_eluna` (see [Where to change config](#where-to-change-config)).
 - Runtime persistence in `ac_eluna`: `boss_activity_runtime`, `boss_activity_config` (shared with the AGMP panel),
-  `boss_activity_config_ext` (script-private settings), `boss_activity_events`, `boss_activity_contributors`.
+  `boss_activity_config_ext` (script-private settings), `boss_reward_pools`, `boss_activity_events`, `boss_activity_contributors`.
 - Automatic schema bootstrap and migration in Lua (no Web-side table creation required).
 - Dedicated boss templates: no core `SmartAI` scripts run on top of Eluna.
 - In-game / console commands:
@@ -27,7 +30,8 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 | `.boss clear` (alias `.boss despawn`) | Remove the active boss without rewards and reset the runtime row |
 | `.boss rebase` | Recompute base health from the template and re-apply the multiplier (**out of combat only**) |
 | `.boss config reload` | Hot reload config from `ac_eluna` (used by AGMP after saving) |
-| `.boss config show [group]` | Print the effective config (no group = list the 24 groups) |
+| `.boss config show [group]` | Print the effective config (no group = list the 20 groups) |
+| `.boss pools` | Print the live reward pools (id, name, chance, winner mode, prizes, gold range, announce) and where they came from |
 | `.boss preset list` / `.boss preset <key>` | List / switch the skill preset |
 | `.boss preset random on\|off` | Toggle "draw a random skill preset on every spawn" (same ext config as the panel) |
 | `.boss preset pool <key,key>` / `pool all` | Set the random pool / clear it (empty = every preset) |
@@ -39,9 +43,9 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 `boss.lua` keeps **shipped defaults** in one place (§3 "配置区" at the top of the file). Once a row
 exists in the database those defaults are no longer used — bootstrap writes happen with `INSERT IGNORE`. Precedence:
 
-1. **AGMP panel** — the *Basic config* tab edits `boss_activity_config` (boss identity, stats, spawn points, skill preset, participation weights); the *Extended config* tab edits `boss_activity_config_ext` (yells, taunts, AI cadence, phase thresholds, patrol, minions, helpers, classes, managed tiers, random skill preset, **the six reward pools**, schedule), grouped into second-level tabs.
-2. **Database** — `boss_activity_config` (panel-shared columns) and `boss_activity_config_ext` (script-private columns).
-3. **Script §3 defaults** — only for a brand-new deployment without a config row.
+1. **AGMP panel** — the *Basic config* tab edits `boss_activity_config` (boss identity, stats, spawn points, skill preset, participation weights); the *Extended config* tab edits `boss_activity_config_ext` (yells, taunts, AI cadence, phase thresholds, patrol, minions, helpers, classes, managed tiers, random skill preset, restart recovery, settlement switches, schedule), grouped into second-level tabs; the *Reward pools* tab edits `boss_reward_pools` (any number of pools, gold included).
+2. **Database** — `boss_activity_config`, `boss_activity_config_ext` and `boss_reward_pools`.
+3. **Script §3 defaults** — only for a brand-new deployment without a config row (and as the pool fallback when the pool table is empty).
 
 After editing, run `.boss config reload` (the panel does this automatically) or restart worldserver.
 
@@ -49,8 +53,9 @@ After editing, run `.boss config reload` (the panel does this automatically) or 
 
 | Table | Contents | Written by |
 |---|---|---|
-| `boss_activity_config` | Boss identity, level/scale/health multiplier, auras, ally helper, spawn points, skill preset, **participation weights / eligible range** (reward items live in the six pools of the ext table) | AGMP panel (`REPLACE INTO`, whole row) + Lua |
-| `boss_activity_config_ext` | Yells, combat taunts (12 text lists), AI cadence, phase thresholds, patrol, minion AI, helper entries, class types + class reward pools, managed tier entries, **random skill preset**, **six independent reward pools**, **daily schedule** | Lua (create/seed) + AGMP panel (`INSERT ... ON DUPLICATE KEY UPDATE`, submitted columns only) |
+| `boss_activity_config` | Boss identity, level/scale/health multiplier, auras, ally helper, spawn points, skill preset, **participation weights / eligible range** | AGMP panel (`REPLACE INTO`, whole row) + Lua |
+| `boss_activity_config_ext` | Yells, combat taunts (12 text lists), AI cadence, phase thresholds, patrol, minion AI, helper entries, class types + class reward pools, managed tier entries, **random skill preset**, **restart recovery**, **settlement switches**, **daily schedule** | Lua (create/seed) + AGMP panel (`INSERT ... ON DUPLICATE KEY UPDATE`, submitted columns only) |
+| `boss_reward_pools` | **Reward pools**: any number of rows per realm, each with its own chance / winner mode / prizes / gold range / announce flag | AGMP panel (Reward pools tab) + Lua (reads; seeds nothing) |
 
 The split is required: AGMP saves the main table with `REPLACE INTO`, which resets every column it
 does not know about to the table default; the panel only upserts the ext table, so script-private
@@ -66,9 +71,11 @@ Lua descriptor table column by column.
    `group / column / kind / target / key` (ext rows also need `ddl`).
 3. The ext table DDL, the read path, the write path and `.boss config show` all follow
    automatically. To make it editable in the panel, add the column at the end of AGMP's
-   `config/boss.php` (`ext_fields`, with type/bounds) plus its zh_CN/en label —
-   `php tools/verify_boss_ext_page.php` cross-checks the panel schema against this
-   descriptor table column by column.
+   `config/boss.php` (`ext_fields`, with type/bounds) plus its zh_CN/en label.
+4. Cross-check the four places that must agree — `pwsh -File tools/verify-boss-schema.ps1` compares this
+   descriptor table against the DBA DDL (`sql/2026_09_24_activity_boss_config_ext.sql`), AGMP's
+   `ext_fields` and (with `-DbName`/`-DbPassword`) the live ext table, names and order included;
+   `php tools/verify_boss_ext_page.php` (in the panel repo) covers the page rendering as well.
 
 Value kinds (`kind`): `int`, `bool`, `scaled` (decimal ×100 stored as INT), `text`,
 `text_keep`, `intlist`, `lines`, `keyedlines`, `keyedword`, `keyedintlist`, `spawnpoints`.
@@ -132,42 +139,75 @@ as a comma-separated key list).
 - Display strings (class names), minion scatter distances and a few condition constants:
   logic constants rather than tunables.
 
-## Rewards: six independent pools
+## Rewards: a pool table with any number of pools
 
-Six identically shaped, fully independent reward pools live in `boss_activity_config_ext`
-(AGMP → Extended config → Reward pools); each pool has six fields:
+Pools live in their own table, `boss_reward_pools` (AGMP → Reward pools). The pool count is not fixed
+and each pool is configured independently:
 
-| Field | Meaning |
+| Column | Meaning |
 |---|---|
-| `reward_pool_N_enabled` | Whether the pool takes part in the payout at all |
-| `reward_pool_N_chance` | Trigger chance (%), rolled once per kill for every enabled pool |
-| `reward_pool_N_winner_mode` | `all` = every eligible player wins; `count` = draw a fixed number of winners (weighted by contribution or pure random, see `random_reward_mode`) |
-| `reward_pool_N_winner_count` | Winner count for `count` mode (never more than the number of eligible players) |
-| `reward_pool_N_class_filter` | "Only prizes the winner can actually use" (on by default) |
-| `reward_pool_N_items_text` | Prize item IDs; each winner draws **one** item from the pool |
+| `pool_id` | Bit number in `boss_activity_contributors.reward_pools_mask` (bit = `pool_id - 1`); assigned once, never reused, max 31 |
+| `sort_order` | Payout and display order (independent of `pool_id`) |
+| `name` | Display name used in logs and the announcement |
+| `enabled` | Whether the pool takes part in the payout at all |
+| `chance` | Trigger chance (%), rolled once per kill for every enabled pool |
+| `winner_mode` | `all` = every eligible player wins; `count` = draw a fixed number of winners (weighted by contribution or pure random, see `random_reward_mode`) |
+| `winner_count` | Winner count for `count` mode (never more than the number of eligible players) |
+| `class_filter` | "Only prizes the winner can actually use" (on by default) |
+| `items_text` | Prize item IDs; each winner draws **one** item from the pool |
+| `gold_min_copper` / `gold_max_copper` | Gold per winner, in copper; both `0` = this pool pays no gold |
+| `announce` | Whether this pool's winners appear in the world announcement |
+| `deleted_at` | Soft delete: `> 0` means retired. The bit number stays reserved so old snapshots keep their meaning |
 
-Settlement on boss death: build the eligible-participant list → roll each enabled pool once → turn the winner mode into a winner
-list → every winner draws one item **they can use** from that pool. Pools never affect each other, the per-pool win bitmap is stored
-in `boss_activity_contributors.reward_pools_mask` (bit N = pool N won) and the `reward_granted` event carries the full breakdown.
+Settlement on boss death: build the eligible-participant list → roll each enabled pool once (in `sort_order`) → turn the winner
+mode into a winner list → every winner draws one item **they can use** plus `random(gold_min, gold_max)` copper. Pools never
+affect each other, the win bitmap is stored in `boss_activity_contributors.reward_pools_mask`, and the `reward_granted` event
+carries the full breakdown (pool id, name, winners, gold total, failures). A pool with neither items nor gold is skipped with a
+log line; `winner_count` ≥ the eligible count is truncated to everyone with an explicit `⚠` warning.
+
+**Offline winners are kept.** A participant who logged off before the kill is still eligible and receives that pool's items and
+gold by in-game mail, filtered by the class recorded while they were online; set `offline_reward_delivery` to `0` to skip them
+instead (the log says so). Contribution records therefore carry `class_id`.
 
 **Class filtering (never hand out unusable gear)** — with `class_filter=1`, usability of each prize is decided like this:
 
 1. the item appears in *Class config → class reward pools* (`class_reward_items_text`, key = class ID) → **that map is authoritative**:
-   only a class whose list contains the item may receive it;
+   only a class whose list contains the item may receive it (offline winners are matched by the recorded class);
 2. the item is absent from the map (mounts / formulas / generic items) → ask the core `Player:CanUseItem`
-   (class/race/level restrictions);
+   (class/race/level restrictions); offline winners get generic items without that check;
 3. the core gives no verdict (old build / exception) → treat the item as unrestricted so a pool never silently dries up.
 
 Pools may therefore mix all classes' gear: warriors only receive warrior-list items, mages only
 mage-list items, and a winner with nothing usable in that pool skips it (the log says why).
 
-Factory defaults: pool 1 "guaranteed" everyone 100% (`40753`), pool 2 "base" 3 winners 100%,
-pool 3 "formula" 3 winners 10%, pool 4 "mount" 1 winner 15%, pool 5 "class" 3 winners 60% (union of
-the 27 class items + class filter), pool 6 off as a spare.
+Factory defaults (also the fallback when the table is missing or has no rows for this realm — `.boss pools` shows the source):
+pool 1 "all" everyone 100% (`40753`), pool 2 "base" 3 winners 100%, pool 3 "formula" 3 winners 10%, pool 4 "mount" 1 winner 15%,
+pool 5 "class" 3 winners 60%, pool 6 off as a spare.
 
-**Upgrading an existing deployment**: run `sql/2026_09_26_reward_pools.sql` once (idempotent: adds the six pools' columns → seeds the
-default prize lists on existing rows → drops the 13 legacy reward columns), then `.reload ale` or restart the worldserver; `boss.lua`
-performs the same add/drop migration at load time.
+**Upgrading an existing deployment**: run `sql/2026_09_30_reward_pools_v2.sql` (idempotent: creates the table, seeds the
+factory pools per realm, moves the legacy gold range onto pool 1) and then `sql/2026_09_30_boss_recovery_columns.sql`.
+`boss.lua` drops the 13 legacy reward columns of `boss_activity_config` — including `gold_min_copper`/`gold_max_copper` — at
+load time, so the migration must run **before** the new script is loaded. On a database that ran the previous model
+(`reward_pool_N_*` columns in the ext table), `sql/2026_09_30_reward_pools_ext_cleanup.sql` drops those 36 obsolete columns;
+it refuses to run while `boss_reward_pools` is empty. `boss.lua` itself also creates the pool table if it is missing and seeds
+the factory pools for its realm when the table has no rows for it, so a fresh install needs no SQL at all.
+
+## Surviving a worldserver restart
+
+The boss is a scripted temporary spawn (never `save=true` in the world database), so a restart destroys the creature. Instead
+of losing the encounter, the script records what it needs and rebuilds it:
+
+- `boss_activity_runtime` stores the spawn point index, the skill preset/difficulty the boss was using, and the health
+  percentage (`health_pct`), sampled on engage, on phase change, on leaving combat and every `health_sample_interval_sec`
+  seconds in between.
+- Loading the script only sets a *pending* flag; the **first schedule tick** rebuilds the boss at the recorded spawn point,
+  with the recorded preset and `health_pct` of its freshly computed maximum health, floored at `recovery_min_health_pct` so a
+  2% corpse does not come back already dying. `boss_recovered_yell` (`{BOSS_NAME}` / `{HEALTH_PCT}`) is announced on the spot.
+- Nothing is rebuilt when the schedule window is closed (`runtime_recovered_skipped`) or when the recorded entry is not a
+  managed template (`runtime_recovery_failed`); both reset the runtime row to `idle`, write a `boss_activity_events` row for the
+  panel, and are not retried.
+- A restart is a **new fight**: contribution, threat, minions and allies all start over, and a boss killed before the restart
+  (`status = cooldown`) is not resurrected.
 
 ## Random skill preset
 
@@ -269,7 +309,7 @@ The activity boss uses dedicated level-83 templates with no `AIName`, no `smart_
 
 ## Testing without a server
 
-`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts 219 invariants: load-time behaviour, SQL construction for both config tables, ext-table DDL/INSERT column consistency, command markers, `.boss config show` output, "database values win over script defaults", `.boss clear` side effects, event registration, the daily schedule, the random skill preset, **skill pool / combo content** (every combo spell must live in its preset's pools, combo names globally unique, at least 6 combos per preset, 4 difficulties x 10 presets scale without hitting the `ClampNumber(10,80)` clamp, default-library yell coverage for every combo), **combo casting (offline driven)** (fake boss + fake player drive the real `TryComboChain` and cast loop: the trigger tick only fires the first spell and queues the rest, the queue drains one spell per idle tick, the accumulated cast sequence equals a declared combo, per-combo and global cooldowns are written at trigger time, the yell equals the configured text), the six reward pools (including a full `OnBossDied` payout run), multi-realm binding, and the regressions above. See `tools/boss-lua-smoke/README.md`.
+`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts its invariants: load-time behaviour, SQL construction for all config tables, ext-table DDL/INSERT column consistency, the schema contract self-check, command markers, `.boss config show` / `.boss pools` output, "database values win over script defaults", `.boss clear` side effects, event registration, the daily schedule, the random skill preset, **skill pool / combo content** (every combo spell must live in its preset's pools, combo names globally unique, at least 6 combos per preset, 4 difficulties x 10 presets scale without hitting the `ClampNumber(10,80)` clamp, default-library yell coverage for every combo), **combo casting (offline driven)** (fake boss + fake player drive the real `TryComboChain` and cast loop: the trigger tick only fires the first spell and queues the rest, the queue drains one spell per idle tick, the accumulated cast sequence equals a declared combo, per-combo and global cooldowns are written at trigger time, the yell equals the configured text), **reward pools** (rows loaded from `boss_reward_pools` in `sort_order`, the code-default fallback, bitmap bit mapping for pool ids outside 1..6, a full `OnBossDied` payout run, per-pool gold), **cross-restart recovery** (rebuild with the recorded spawn point / preset / health percentage, plus the schedule-closed and bad-entry paths), **offline delivery** (`SendMail` for a contributor who is gone at kill time) and **write-failure visibility** (a failing write is logged and counted instead of silently passing), multi-realm binding, and the regressions above. See `tools/boss-lua-smoke/README.md`.
 
 ```
 lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass
@@ -280,7 +320,7 @@ lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass
 - AzerothCore 3.3.5a with Eluna enabled (tested against `mod-ale`, the Eluna fork used by AzerothCore).
 - MySQL/MariaDB with the `characters` DB accessible.
 - Script placed in the `lua_scripts` load path.
-- The script talks to the `ac_eluna` schema through `CharDBQuery`/`CharDBExecute`; the name is the `BOSS_DB_NAME` constant at the top of `boss.lua`. When several realms share one auth database, give each realm its own schema (see "Multi-realm deployment" below) and mirror it in the panel's `config/boss.php` `server_overrides`.
+- The script talks to the `ac_eluna` schema through `CharDBQuery`/`CharDBExecute`; the name is the `BOSS_DB_NAME` constant at the top of `boss.lua`. Several realms normally share that one schema and are kept apart by `state_key` (each realm needs its own key, not its own database); a private schema per realm is optional and must then be mirrored in the panel's `config/boss.php` `server_overrides`. See "Multi-realm deployment" below.
 
 ## Install
 

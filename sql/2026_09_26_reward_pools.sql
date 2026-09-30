@@ -1,6 +1,9 @@
 -- ============================================================================
 --  2026_09_26 — 活动 Boss 奖励改版：旧「保底/基础/公式/坐骑/职业 + 金币」→ 6 个独立奖池
 -- ----------------------------------------------------------------------------
+--  ⚠ 已被 2026_09_30_reward_pools_v2.sql 取代：奖池现在是 `boss_reward_pools` 表（数量任意 +
+--    金币区间 + 软删除 + 位号不复用），扩展表的 reward_pool_N_* 列属上一版模型。
+--    只有在需要复现上一版行为时才执行本文件。
 --  模型：每个奖池 = 开启 / 触发概率(%) / 获奖人数模式(all=全部有效参战, count=指定数量) /
 --        获奖人数 / 是否按职业过滤奖品 / 奖品物品ID列表（每人随机 1 件）。
 --        Boss 死亡时每个已开启的奖池各掷一次概率；命中后按人数模式挑人，
@@ -14,8 +17,7 @@
 --       boss.lua 加载时也会执行同样的删除；两者谁先跑都行。
 --
 --  用法（必须用 mysql 客户端，因为用到 DELIMITER / 存储过程）：
---    "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -h 127.0.0.1 -P 43306 -u root -p \
---        --default-character-set=utf8mb4 ac_eluna < 2026_09_26_reward_pools.sql
+--    mysql -h <host> -P <port> -u root -p --default-character-set=utf8mb4 ac_eluna < 2026_09_26_reward_pools.sql
 --  然后：游戏内 `.reload ale`（或重启 worldserver）→ `.boss config reload`
 --
 --  注意：旧模型里的「职业奖励池」映射（`class_reward_items_text`）**保留不删**：

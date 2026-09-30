@@ -6,13 +6,15 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 - 智能战斗 AI、多套技能池预设与技能节奏档位。
 - **技能池随机**：开启后每次生成/重生从面板勾选的预设池里随机抽一套（面板「扩展配置 → 技能池随机」），见下。
-- **6 个独立奖池**：开关 / 概率 / 获奖人数（全部有效参战或指定数量）/ 奖品物品列表各自独立配置，
-  面板里奖品填物品ID、下方直接显示物品名；奖品按职业过滤，不会发出玩家用不了的装备（见「奖励：6 个独立奖池」）。
+- **奖池表（数量任意）**：奖池存在独立表 `boss_reward_pools` 里，开关 / 概率 / 获奖人数（全部有效参战或指定数量）/
+  奖品物品列表 / **金币区间** 各自独立配置，可任意增删（位号不复用）；
+  面板里奖品填物品ID、下方直接显示物品名；奖品按职业过滤，不会发出玩家用不了的装备；击杀前已下线的参战者走邮件补发（见「奖励：奖池表」）。
 - **可切换的强度档位**，由专用 `creature_template` 承载（见下）。
 - **定时启停**：按每天的时间段自动开始/结束活动 Boss（面板「扩展配置 → 定时启停」），见下。
+- **跨 worldserver 重启存活**：停服/崩溃重启后按原刷新点、原技能预设重建，血量按重启前百分比折算（见下）。
 - **配置全部落库**：脚本里只保留默认值，运行期以 `ac_eluna` 为准（见下「配置在哪里改」）。
 - 运行时数据落在 `ac_eluna`：`boss_activity_runtime`、`boss_activity_config`、
-  `boss_activity_config_ext`、`boss_activity_events`、`boss_activity_contributors`。
+  `boss_activity_config_ext`、`boss_reward_pools`、`boss_activity_events`、`boss_activity_contributors`。
 - 表结构由 Lua 自举与迁移（不需要 Web 端建表）。
 - 活动 Boss 使用**专用模板**，不会与核心 `SmartAI` 形成双 AI。
 - 命令：
@@ -26,7 +28,8 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 | `.boss clear`（别名 `.boss despawn`） | 直接移除活跃 Boss、不发奖励并复位运行时记录 |
 | `.boss rebase` | 按模板重算基准血量再套用倍率（**仅脱战可用**） |
 | `.boss config reload` | 从 `ac_eluna` 热加载配置（AGMP 保存后自动调用） |
-| `.boss config show [分组]` | 查看当前生效的配置项（不带分组则列出 24 个分组） |
+| `.boss config show [分组]` | 查看当前生效的配置项（不带分组则列出 20 个分组） |
+| `.boss pools` | 查看当前生效的奖池（位号/池名/概率/人数模式/奖品数/金币区间/是否公告）与来源 |
 | `.boss preset list` / `.boss preset <key>` | 查看 / 切换技能池预设 |
 | `.boss preset random on\|off` | 开关「每次刷新随机选一套技能预设」（与面板同一份 ext 配置） |
 | `.boss preset pool <key,key>` / `pool all` | 设置随机池 / 清空随机池（清空 = 全部预设） |
@@ -39,7 +42,7 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 默认值不生效（引导写入用 `INSERT IGNORE`）。改配置按优先级：
 
 1. **AGMP 面板** —— 「基础配置」Tab 改主表 `boss_activity_config` 的列（Boss 身份/属性/刷新点/技能池/选人权重）；
-   「扩展配置」Tab 改 `boss_activity_config_ext`（喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板/技能池随机/**6 个奖池**/定时启停，
+   「扩展配置」Tab 改 `boss_activity_config_ext`（喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板/技能池随机/跨重启恢复/结算开关/定时启停，
    内部再按二级 Tab 分组）。
 2. **直接改数据库** —— `boss_activity_config`（面板共享列）与 `boss_activity_config_ext`（脚本私有列）都可以。
 3. 改脚本 §3 的默认值 —— 只影响「数据库里还没有这一行」的全新部署。
@@ -50,8 +53,9 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 | 表 | 内容 | 谁写 |
 |---|---|---|
-| `boss_activity_config` | Boss 身份、等级/体型/血量倍率、光环、友方援军、刷新点、技能池、**选人权重/有效参战范围**（奖励物品在扩展表的 6 个奖池里） | AGMP 面板（`REPLACE INTO` 整行重写）+ Lua |
-| `boss_activity_config_ext` | 喊话、战斗嘲讽（12 组文本）、AI 节奏、战斗阶段阈值、巡逻、小怪 AI、援军模板、**职业类型（AI 选目标用）**、职业过滤映射（奖池用）、受管模板、**技能池随机**、**6 个独立奖池**、**定时启停** | Lua 建表/引导 + AGMP 面板（`INSERT ... ON DUPLICATE KEY UPDATE` 只改提交的列） |
+| `boss_activity_config` | Boss 身份、等级/体型/血量倍率、光环、友方援军、刷新点、技能池、**选人权重/有效参战范围** | AGMP 面板（`REPLACE INTO` 整行重写）+ Lua |
+| `boss_activity_config_ext` | 喊话、战斗嘲讽（12 组文本）、AI 节奏、战斗阶段阈值、巡逻、小怪 AI、援军模板、**职业类型（AI 选目标用）**、职业过滤映射（奖池用）、受管模板、**技能池随机**、**跨重启恢复**、**结算开关**、**定时启停** | Lua 建表/引导 + AGMP 面板（`INSERT ... ON DUPLICATE KEY UPDATE` 只改提交的列） |
+| `boss_reward_pools` | **奖池**：每区任意行数，每行独立配置概率/人数模式/奖品/金币区间/是否公告 | AGMP 面板「奖池」页 + Lua 只读 |
 
 必须拆两张表：AGMP 保存主表时用 `REPLACE INTO` 重写整行，凡不在它列清单里的列都会被重置为建表
 默认值，脚本私有配置放主表会被面板保存清掉；面板对 ext 表只做 upsert，所以脚本后续新增的列不会被
@@ -64,8 +68,10 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 2. 在 `BOSS_CONFIG_SCHEMA_MAIN`（面板共享列，需同时改 AGMP 与建表语句）或
    `BOSS_CONFIG_SCHEMA_EXT`（脚本私有列）里加一行：`group / column / kind / target / key`，ext 列还要给 `ddl`；
 3. ext 表的建表语句、读、写、`.boss config show` 展示都会自动跟着变；如果要能在面板里编辑，
-   再到 AGMP 的 `config/boss.php` 末尾补 `ext_fields`（列名/类型/边界）+ 中英文语言的字段名，
-   `php tools/verify_boss_ext_page.php` 会逐列比对脚本与面板是否一致。
+   再到 AGMP 的 `config/boss.php` 末尾补 `ext_fields`（列名/类型/边界）+ 中英文语言的字段名；
+4. 四处对齐用 `pwsh -File tools\verify-boss-schema.ps1` 核对：它把描述表与 DBA 预建 DDL
+   （`sql/2026_09_24_activity_boss_config_ext.sql`）、AGMP `ext_fields`、以及（带 `-DbName`/`-DbPassword` 时）
+   线上扩展表逐列比对（列名 + 顺序，线上表只比列名）；面板渲染另由面板仓库的 `php tools/verify_boss_ext_page.php` 覆盖。
 
 配置项的取值类型（`kind`）：`int` / `bool` / `scaled`（小数 ×100 存 INT）/ `text` /
 `text_keep` / `intlist` / `lines` / `keyedlines` / `keyedword` / `keyedintlist` / `spawnpoints`。
@@ -115,22 +121,33 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
   **库里的值会整体覆盖脚本默认值**，所以只改脚本默认文案线上不会生效。
 - 显示用文本（职业中文名等）、小怪召唤的散布半径、技能条件里的个别常量：属于逻辑常量，不是调参项。
 
-## 奖励：6 个独立奖池
+## 奖励：奖池表（数量任意）
 
-6 个结构相同、完全独立的奖池配置在 `boss_activity_config_ext`（AGMP 面板「扩展配置 → 奖池」），每池 6 个字段：
+奖池在独立表 `boss_reward_pools`（AGMP 面板「奖池」）里，**池数量不固定**，每池独立配置：
 
-| 字段 | 说明 |
+| 列 | 说明 |
 |---|---|
-| `reward_pool_N_enabled` | 是否开启该奖池（关闭 = 完全不参与结算） |
-| `reward_pool_N_chance` | 触发概率（%，每次击杀每个开启的奖池各掷一次） |
-| `reward_pool_N_winner_mode` | `all` = 全部有效参战者都拿；`count` = 抽指定人数（按贡献加权或纯随机，见主表 `random_reward_mode`） |
-| `reward_pool_N_winner_count` | `count` 模式的获奖人数（不会超过有效参战人数） |
-| `reward_pool_N_class_filter` | 是否「只发该玩家能用的奖品」（默认开） |
-| `reward_pool_N_items_text` | 奖品物品ID列表；每位获奖者从中随机抽 **1 件** |
+| `pool_id` | 位号：`boss_activity_contributors.reward_pools_mask` 的第 `pool_id-1` 位；创建后不复用，上限 31 |
+| `sort_order` | 发放与展示顺序（与位号解耦） |
+| `name` | 展示名（日志、世界通告、面板） |
+| `enabled` | 是否开启该奖池（关闭 = 完全不参与结算） |
+| `chance` | 触发概率（%，每次击杀每个开启的奖池各掷一次） |
+| `winner_mode` | `all` = 全部有效参战者都拿；`count` = 抽指定人数（按贡献加权或纯随机，见主表 `random_reward_mode`） |
+| `winner_count` | `count` 模式的获奖人数（不会超过有效参战人数） |
+| `class_filter` | 是否「只发该玩家能用的奖品」（默认开） |
+| `items_text` | 奖品物品ID列表；每位获奖者从中随机抽 **1 件** |
+| `gold_min_copper` / `gold_max_copper` | 每位获奖者的金币区间（铜）；两者都为 0 = 该池不发金币 |
+| `announce` | 该池的获奖者是否进世界通告 |
+| `deleted_at` | 软删除（`> 0` = 已删除）。位号保留不回收，历史快照的位图才能一直解释得通 |
 
-结算流程（Boss 死亡时）：算出有效参战者 → 每个开启的奖池各掷一次概率 → 命中后按人数模式定获奖名单 →
-每位获奖者从该池里随机抽 1 件**自己能用的**物品；同一轮里各池互不影响，中奖位图写进
-`boss_activity_contributors.reward_pools_mask`（第 N 位 = 中过奖池 N），事件流水里也有 `reward_granted` 明细。
+结算流程（Boss 死亡时）：算出有效参战者 → 每个开启的奖池按 `sort_order` 各掷一次概率 → 命中后按人数模式定获奖名单 →
+每位获奖者从该池里随机抽 1 件**自己能用的**物品，外加 `random(gold_min, gold_max)` 铜；同一轮里各池互不影响，中奖位图写进
+`boss_activity_contributors.reward_pools_mask`（第 N 位 = 中过奖池 N），事件流水里的 `reward_granted` 带完整明细
+（池位号、池名、获奖人数、金币总额、失败数）。既没有物品也没有金币的池会跳过并打日志；
+`winner_count` ≥ 有效参战人数时按全员截断并打 ⚠ 告警。
+
+**离线获奖者不再被丢掉**：击杀前已下线的参战者仍然有效，该池的物品与金币通过游戏内邮件补发，按他在线时记下的职业过滤；
+把 `offline_reward_delivery` 设为 `0` 则跳过（日志会写明）。贡献快照因此多一列 `class_id`。
 
 **按职业过滤（不会发不能用的装备）** —— `class_filter=1` 时，每件奖品的可用性判定：
 
@@ -142,11 +159,30 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 所以奖池里可以放心混放各职业的装备：战士只会拿到战士列表里的，法师只会拿到法师列表里的；
 某位获奖者在该池里一件能用的都没有时，他这一池就跳过（日志会写明原因）。
 
-出厂默认：池 1「保底」全员 100%（`40753`）、池 2「基础」3 人 100%、
-池 3「公式」3 人 10%、池 4「坐骑」1 人 15%、池 5「职业」3 人 60%（27 件职业装备并集 + 按职业过滤）、池 6 关闭备用。
+出厂默认（也是表缺失/本区无行时的回退，`.boss pools` 会显示来源）：池 1「全员奖」全员 100%（`40753`）、
+池 2「基础奖池」3 人 100%、池 3「公式奖池」3 人 10%、池 4「坐骑奖池」1 人 15%、
+池 5「职业奖池」3 人 60%（职业装备并集 + 按职业过滤）、池 6「备用奖池」关闭。
 
-**升级已有部署**：跑一次 `sql/2026_09_26_reward_pools.sql`（幂等：补 6 个奖池的列 → 给已有行补上默认奖品 →
-删掉旧奖励模型的 13 个列），再 `.reload ale` / 重启 worldserver；`boss.lua` 加载时也会自己做同样的补列/删列。
+**升级已有部署**：先跑 `sql/2026_09_30_reward_pools_v2.sql`（幂等：建表 → 按区补 6 个出厂池 → 把旧模型的金币区间迁到池 1），
+再跑 `sql/2026_09_30_boss_recovery_columns.sql`。`boss.lua` 加载时会删掉主表 `boss_activity_config` 的 13 个旧奖励列
+（含 `gold_min_copper`/`gold_max_copper`），所以迁移必须在**新版脚本加载之前**执行。跑过上一版奖池模型（扩展表里有
+`reward_pool_N_*` 列）的库，用 `sql/2026_09_30_reward_pools_ext_cleanup.sql` 删掉那 36 个废弃列；
+它在 `boss_reward_pools` 为空时会直接报错拒绝执行。脚本自身也会在表缺失时建表、在本区没有行时按出厂默认播种，
+所以全新安装不需要跑任何 SQL。
+
+## 跨 worldserver 重启存活
+
+Boss 是脚本临时生成的生物（从不 `save=true` 落进 world 库），重启后生物对象必然消失。为了不让活动就此中断，
+脚本把重建所需的信息落库，重启后按它重建：
+
+- `boss_activity_runtime` 记录刷新点序号、这只 Boss 当时用的技能预设/强度档位，以及血量百分比 `health_pct`
+  （进战、阶段切换、脱战各采样一次，战斗中每 `health_sample_interval_sec` 秒补一次）。
+- 脚本加载时只置「待恢复」标志；**首个定时 tick** 才在原刷新点重建，沿用记录的预设，血量按「重建后的最大生命 × `health_pct`%」
+  折算，并且不低于 `recovery_min_health_pct`（避免 2% 残局一回来就濒死）。重建当场播报 `boss_recovered_yell`
+  （支持 `{BOSS_NAME}` / `{HEALTH_PCT}`）。
+- 两种情况不重建：当前不在活动时间段内（写 `runtime_recovered_skipped`）、记录里的 entry 不是受管模板
+  （写 `runtime_recovery_failed`）。两者都会把运行态复位为 `idle`，并在 `boss_activity_events` 里留痕供面板查看，且不重试。
+- 重启算**新的一场**：贡献、仇恨、小怪与友方援军全部重来；重启前已被击杀的 Boss（`status = cooldown`）不会复活。
 
 ## 技能池随机
 
@@ -242,15 +278,17 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 
 ## 不启动服务器也能测
 
-`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言 219 项不变量：
-加载流程、两张配置表的 SQL 构造、扩展表建表/写入列一致性、命令标记、`.boss config show` 输出、
+`tools/boss-lua-smoke/smoke.lua` 把 `boss.lua` 加载进桩化的 Eluna 环境（不需要 `worldserver`），断言这些不变量：
+加载流程、各配置表的 SQL 构造、扩展表建表/写入列一致性、列契约自检、命令标记、`.boss config show` / `.boss pools` 输出、
 「数据库值确实覆盖脚本默认值」、`.boss clear` 副作用、事件注册、定时启停、技能池随机、
 **技能池 / 连招内容**（连招法术必须在本预设池内、连招名全局唯一、每个预设至少 6 条连招、
 四档难度缩放后冷却与概率不撞 `ClampNumber(10,80)` 钳制、文件内默认库的连招喊话全覆盖）、
 **连招施放（离线驱动）**（假 Boss + 假玩家驱动真实的 `TryComboChain` 与施放循环：触发 tick 只发第一发、其余进入
 `state.pendingCasts` 队列，之后的空闲 tick 逐发排空，累计施放序列 == 某条连招；连招冷却按**触发时刻快照**核对）、
-自身冷却与全局冷却写入、喊话内容 == 配置值）、
-6 个独立奖池（含跑通整条 `OnBossDied` 实发流程）、多区绑定，以及上面那些回归。用法见 `tools/boss-lua-smoke/README.md`。
+**奖池**（从 `boss_reward_pools` 按 `sort_order` 读行、代码默认回退、非 1..6 位号的位图映射、跑通整条 `OnBossDied` 实发流程、池内金币）、
+**跨重启恢复**（按记录的刷新点/预设/血量百分比重建，含"时段外跳过"与"entry 非法失败"两条负路径）、
+**离线补发**（击杀时已下线的贡献者收到 `SendMail`）与**写库失败可见**（写失败必须落日志并计数，不允许静默通过）、
+多区绑定，以及上面那些回归。用法见 `tools/boss-lua-smoke/README.md`。
 
 ```
 lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
@@ -261,7 +299,7 @@ lua smoke.lua /path/to/boss.lua          # 退出码 0 = 全部通过
 - AzerothCore 3.3.5a + Eluna（在 AzerothCore 使用的 Eluna 分支 `mod-ale` 上验证）。
 - MySQL/MariaDB，且能访问 `characters` 库。
 - 脚本放在 `lua_scripts` 加载路径下。
-- 脚本通过 `CharDBQuery`/`CharDBExecute` 访问 `ac_eluna` 库；库名是 `boss.lua` 顶部的 `BOSS_DB_NAME` 常量，多区部署时每个区改成自己的库名（见下面「多区部署」），改完面板 `config/boss.php` 的 `server_overrides` 也要同步。
+- 脚本通过 `CharDBQuery`/`CharDBExecute` 访问 `ac_eluna` 库；库名是 `boss.lua` 顶部的 `BOSS_DB_NAME` 常量。多区通常**共用这一个库**、靠 `state_key` 分租（每个区要的是自己的 key，不是自己的库）；想给某个区单独一个库也可以，那样才需要改库名并同步面板 `config/boss.php` 的 `server_overrides`。见下面「多区部署」。
 
 ## 安装
 

@@ -10,14 +10,14 @@
 --  强度只由 HealthModifier / DamageModifier 决定，避免复用 647 模板时与 Eluna 形成双 AI。
 --
 --  数值口径（改完 .reload creature_template 生效，无需重启）：
---    基准血量 H = creature_classlevelstats(level=83, class=1).basehp2(13945) × HealthModifier × 1
---    实际血量   = H × boss_health_multiplier（面板「血量倍率」，线上当前 1500，下表按 1500 计）
+--    基准血量 H = creature_classlevelstats(level=83, class=1).basehp2(13945) × HealthModifier × _GetHealthMod(rank)
+--    实际血量   = H × (boss_health_multiplier_scaled / 100)      ← 面板「血量倍率」是全局旋钮（各区可不同）
 --    近战基伤   = creature_classlevelstats(level=83, class=1).damage_exp2(177.07) × DamageModifier
---    档位    entry    HealthModifier   基准H     实际血量(×1500)   DamageModifier  近战/击   rank  适用场景
---    入门    190090   0.21              2,928    ≈ 4,392,700      1.0             ≈177      1     与现网同级，单人/小队可达
---    标准    190091   0.60              8,367    ≈ 12,550,500     2.0             ≈354      1     5 人小队（80 级，约 10 分钟）
---    困难    190092   1.45             20,220    ≈ 30,330,000     4.0             ≈708      3     10 人团
---    团本    190093   3.60             50,202    ≈ 75,303,000     7.0             ≈1,239    3     25 人团 / 高压
+--    档位    entry    HealthModifier   基准H    DamageModifier  近战/击   rank  适用场景
+--    入门    190090   0.21              2,928    1.0             ≈177      1     与现网同级，单人/小队可达
+--    标准    190091   0.60              8,367    2.0             ≈354      1     5 人小队（80 级，约 10 分钟）
+--    困难    190092   1.45             20,220    4.0             ≈708      3     10 人团
+--    团本    190093   3.60             50,202    7.0             ≈1,239    3     25 人团 / 高压
 --    改某一档：UPDATE 该 entry 的 HealthModifier / DamageModifier 后 .reload creature_template；
 --    整体缩放改面板「血量倍率」。参考：WotLK 团本 Boss 的 HealthModifier 165–1250、DamageModifier 35–139。
 --
@@ -189,12 +189,14 @@ SET `boss_entry` = 190090,
 WHERE `state_key` = 'current';
 
 -- ---------------------------------------------------------------------------
-SELECT `entry`, `name`, `subname`, `minlevel`, `maxlevel`, `exp`, `rank`,
-       `HealthModifier`, `DamageModifier`, `AIName`, `ScriptName`, `lootid`,
-       ROUND(13945 * `HealthModifier` * 1500) AS 预估血量_x1500
-FROM `creature_template`
-WHERE `entry` IN (190090, 190091, 190092, 190093)
-ORDER BY `entry`;
+-- 预估血量 = 基准H × 该区面板倍率（这里直接读配置表的 boss_health_multiplier_scaled/100）
+SELECT t.`entry`, t.`name`, t.`subname`, t.`minlevel`, t.`maxlevel`, t.`exp`, t.`rank`,
+       t.`HealthModifier`, t.`DamageModifier`, t.`AIName`, t.`ScriptName`, t.`lootid`,
+       ROUND(13945 * t.`HealthModifier` * (c.`boss_health_multiplier_scaled` / 100)) AS 预估血量_按本区倍率
+FROM `creature_template` t
+LEFT JOIN `ac_eluna`.`boss_activity_config` c ON c.`state_key` = 'current'
+WHERE t.`entry` IN (190090, 190091, 190092, 190093)
+ORDER BY t.`entry`;
 
 SELECT `state_key`, `boss_entry`, `boss_name`, `boss_health_multiplier_scaled`
 FROM `ac_eluna`.`boss_activity_config` WHERE `state_key` = 'current';

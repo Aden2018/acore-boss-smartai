@@ -10,13 +10,27 @@
   `CREATE TABLE IF NOT EXISTS`（列由脚本 §3 配置区的 `BOSS_CONFIG_SCHEMA_EXT` 生成），
   首次加载还会用 `INSERT IGNORE` 写入默认值。
 - 该文件用于 DBA 预建表 / 账号无建表权限时代建 / 人工复核列定义；
-  其 DDL 与脚本生成的建表语句逐列一致（列名、类型、默认值、顺序）。
+  其 DDL 与脚本生成的建表语句逐列一致（列名、类型、默认值；物理列序以脚本运行时补列的结果为准）。
 - 加配置项的正确做法：改 `boss.lua` §3 的描述表（并同步本文件与面板 `config/boss.php`，新列追加在末尾），不要只手改数据库。
 - AGMP 面板的「扩展配置」Tab 可以直接编辑这张表（二级 Tab 按分组归集），
   写入用 `INSERT ... ON DUPLICATE KEY UPDATE`（只改提交的列，不会像主表那样被 `REPLACE INTO` 重置）。
 - 查看当前生效值：`.boss config show` / `.boss config show <分组>`
-  （24 个分组：identity basic ally yells taunts ai phase patrol minion skill skill_random
-  respawn spawnpoints schedule helper reward reward_pool_1…6 class_ai class_reward tier）。
+  （20 个分组：identity basic ally yells taunts ai phase patrol minion skill skill_random
+  recovery reward respawn spawnpoints schedule helper class_ai class_reward tier）。
+- 奖池**不在这张表**：见下面的 `boss_reward_pools`。
+
+## 活动 Boss 奖池表与跨重启恢复（2026_09_30）
+
+| 脚本 | 用途 | 顺序要求 |
+|---|---|---|
+| `2026_09_30_reward_pools_v2.sql` | 建 `boss_reward_pools`（每区任意行数奖池）→ 按区补 6 个出厂池 → 把旧模型的金币区间迁到池 1 | **必须在**新版 `boss.lua` 加载前执行：旧金币列 `gold_min_copper` / `gold_max_copper` 会被脚本加载时 DROP |
+| `2026_09_30_boss_recovery_columns.sql` | 运行态 3 列（`health_pct` / `spawn_point_index` / `last_health_sample_at`）+ 贡献表 `class_id` + 扩展表 5 列（recovery 3 + reward 2） | 与上一步同批执行；两者都幂等 |
+| `2026_09_30_reward_pools_ext_cleanup.sql` | 删掉扩展表里 36 个废弃的 `reward_pool_N_*` 列（只对跑过上一版奖池模型的库有意义） | **在上一步之后**执行；`boss_reward_pools` 为空时脚本会报错拒绝执行 |
+
+奖池位号契约：`pool_id = k` ↔ 贡献位图第 `k-1` 位（`reward_pools_mask` 有符号 INT，故上限 31）；
+删除池走软删除（`deleted_at`），位号不复用。面板「奖池」页即这张表的 CRUD。
+
+`tools/deploy-realm.ps1 -ApplyConfigSql <配置库>` 会按上表顺序导入前两个脚本并做命中数断言。
 
 ## 活动 Boss 难度档位（2026_09_23_activity_boss_tiers_190090_190093.sql）
 
@@ -25,17 +39,17 @@
 不要改用副本 Boss（例如死亡矿井的「绿皮队长」entry 647）：647 自带 `AIName=SmartAI`
 与 2 条 `smart_scripts`，会和 Eluna 脚本形成双 AI，面板的技能预设管不到它们。
 
-| entry | 档位 | HealthModifier | DamageModifier | rank | 实际血量（× 面板倍率） |
+| entry | 档位 | HealthModifier | DamageModifier | rank | 基准血量 H |
 |---|---|---|---|---|---|
-| 190090 | 入门 | 0.21 | 1.0 | 1 | 4,392,675（倍率 1500，与旧档同级） |
-| 190091 | 标准 | 0.60 | 2.0 | 1 | 12,550,500 |
-| 190092 | 困难 | 1.45 | 4.0 | 3 | 30,330,376 |
-| 190093 | 团本 | 3.60 | 7.0 | 3 | 75,302,998 |
+| 190090 | 入门 | 0.21 | 1.0 | 1 | 2,928 |
+| 190091 | 标准 | 0.60 | 2.0 | 1 | 8,367 |
+| 190092 | 困难 | 1.45 | 4.0 | 3 | 20,220 |
+| 190093 | 团本 | 3.60 | 7.0 | 3 | 50,202 |
 
 - 模板统一：等级 83 / `exp=2` / `AIName=''` / 无 `smart_scripts` / `lootid=0`（奖励由脚本发放）/ `CreatureImmunitiesId=-229`（Boss 级控制免疫）。
-- 血量公式：`creature_classlevelstats(83, class=1).basehp2(=13945) × HealthModifier × (boss_health_multiplier_scaled/100)`。
-- **面板的「血量倍率」是全局旋钮**：改它会让 4 个档位等比缩放。线上当前倍率 = 1500。
-- 想改某一档的强度：`UPDATE creature_template SET HealthModifier=... , DamageModifier=... WHERE entry=19009x;` 然后 `.reload creature_template`。
+- 血量公式：`creature_classlevelstats(83, class=1).basehp2(=13945) × HealthModifier × _GetHealthMod(rank) × (boss_health_multiplier_scaled/100)`。
+- **面板的「血量倍率」是全局旋钮**：改它会让 4 个档位等比缩放；实际血量因区而异，以面板「基础配置 → 血量倍率」为准（本文件的回读查询会按本区倍率算出来）。
+- 想改某一档的强度：`UPDATE creature_template SET HealthModifier=..., DamageModifier=... WHERE entry=19009x;` 然后 `.reload creature_template`。
   参考量级：真实 WotLK 团本 Boss 的 HealthModifier 165–1250、DamageModifier 35–139。
 
 ### 部署步骤（新环境）

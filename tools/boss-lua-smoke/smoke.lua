@@ -10,9 +10,12 @@
 --  这样脚本打不开日志文件、所有输出都回到 stdout）：
 --      lua.exe smoke.lua "D:\AzerothCore\release\<realm>\lua_scripts\boss.lua"
 --
---  覆盖：配置加载(SQL 构造/两张配置表)、扩展表建表与写入列一致、
---        「数据库值覆盖脚本默认值」、运行时持久化、
---        help/config/config show/preset/difficulty/rebase/kill/clear/spawn/未知子命令、
+--  覆盖：配置加载(SQL 构造/两张配置表)、扩展表建表 + 写入列 + 缺列自动 ALTER、
+--        列契约自检(information_schema 逐行返回存在的列名)、「数据库值覆盖脚本默认值」、
+--        运行时持久化与跨重启恢复(spawned/engaged 首个 tick 重建 + 两条失败路径)、
+--        奖池(boss_reward_pools 表驱动 + 出厂默认回落 + 位图映射 + 金币/离线邮件发放)、
+--        写库失败可见性、结算三段式的收尾韧性、
+--        help/pools/config/config show/preset/difficulty/rebase/kill/clear/schedule/spawn/未知子命令、
 --        非 boss 命令放行，以及「全局 print 未被覆盖」「不再泄漏全局函数」两项回归断言。
 -- ============================================================================
 
@@ -23,8 +26,41 @@ local bossPath = arg and arg[1] or "lua_scripts/boss.lua"
 local MIN_COMBOS_PER_PRESET = 6
 
 -- ---------------------------------------------------------------- 记录与断言
-local recorded = { sql = {}, events = {}, replies = {}, failures = {}, alters = {}, spawnAttempts = 0 }
+local originalPrint = print
+local recorded = {
+    sql = {}, events = {}, replies = {}, failures = {}, alters = {},
+    spawnAttempts = 0, logLines = {}, mails = {}, printFailureFlags = {},
+}
 local scheduledEvents = {}
+
+-- 冒烟环境里 boss.lua 把 print 重绑成了文件级 BossLog（§1），BossLog 打不开日志文件时
+-- 会走它自己的上值 basePrint —— 而 basePrint 是**加载那一刻**的全局 print。所以要在跑 chunk
+-- 之前把全局 print 换成录制器，脚本的每一行日志才会落进 recorded.logLines。
+-- （assertTrue(print == originalPrint) 在录制器撤掉之后再断言，仍然成立。）
+local function captureGlobalPrint(run)
+    local wrapped = function(...)
+        local parts = {}
+        for index = 1, select("#", ...) do
+            parts[#parts + 1] = tostring((select(index, ...)))
+        end
+        recorded.logLines[#recorded.logLines + 1] = table.concat(parts, "\t")
+        originalPrint(...)
+    end
+
+    _G.print = wrapped
+    local ran, err = pcall(run)
+    _G.print = originalPrint
+    if not ran then
+        error(err, 0)
+    end
+end
+
+local function findLogLine(pattern)
+    for _, line in ipairs(recorded.logLines) do
+        if line:find(pattern, 1, true) then return line end
+    end
+    return nil
+end
 
 -- 可控时钟：定时启停要看"此刻是否在时间段内"，必须能设定现在几点。
 -- boss.lua 的 BossNow() 优先用 GetGameTime()，所以改写它即可（os.date 仍按真实时区解析）。
@@ -42,7 +78,6 @@ local function assertTrue(cond, msg)
 end
 
 -- ---------------------------------------------------------------- 核心桩函数
-local originalPrint = print
 local engineCallbacks = { creature = {}, player = {} }
 
 local function mockQuery(values)
@@ -52,6 +87,55 @@ local function mockQuery(values)
         GetFloat = function(_, i) return values[i + 1] end,
         GetString = function(_, i) return tostring(values[i + 1] or "") end,
     }
+end
+
+-- 多行结果集（ALEQuery = 核心 QueryResult：首行即可读，:NextRow() 前进一行并返回是否还有行）。
+-- 三处用到：information_schema 的"存在的列名"、boss_reward_pools、运行态整行。
+-- 首行语义按核心自己的 `do { Fetch() } while (NextRow())` 写法：不调 NextRow 就能读第一行。
+local function mockResultSet(rows)
+    local cursor = 1
+
+    local function cell(index)
+        local row = rows[cursor]
+        if row == nil then return nil end
+        return row[index + 1]
+    end
+
+    return {
+        GetUInt32 = function(_, index) return tonumber(cell(index)) end,
+        GetInt32 = function(_, index) return tonumber(cell(index)) end,
+        GetFloat = function(_, index) return tonumber(cell(index)) end,
+        GetString = function(_, index) return tostring(cell(index) or "") end,
+        NextRow = function()
+            cursor = cursor + 1
+            return rows[cursor] ~= nil
+        end,
+        __rows = rows,
+    }
+end
+
+-- 按 SELECT 里的列名把一份"按列名给出的快照"铺成结果集行；缺列直接判失败
+-- （描述表加了列而快照没跟上时立刻暴露，而不是悄悄回落到文件内默认值）。
+local function rowsFromSelect(sql, values, label)
+    local columnsText = sql:match("SELECT%s+(.-)%s+FROM")
+    if not columnsText then
+        return nil
+    end
+
+    local row, missing = {}, {}
+    for column in columnsText:gmatch("`([%w_]+)`") do
+        local value = values[column]
+        if value == nil then
+            missing[#missing + 1] = column
+        end
+        row[#row + 1] = value
+    end
+
+    if #missing > 0 then
+        fail((label or "数据库") .. "快照缺少列: " .. table.concat(missing, ", "))
+    end
+
+    return mockResultSet({row})
 end
 
 -- 数据库快照（按列名给出，不依赖描述表顺序）：
@@ -67,6 +151,8 @@ local CONFIG_VALUES = {
     random_reward_mode = "weighted", participation_range = 80,
     damage_weight = 100, healing_weight = 80, threat_weight = 35, presence_weight = 10, kill_weight = 3,
     spawn_points_text = "571,4353.573,-4411.8877,151.3909",
+    -- 写入后的回读校验只取这一列（SELECT `updated_at` FROM ... LIMIT 1）
+    updated_at = 1756700000,
 }
 
 local EXT_VALUES = {
@@ -94,23 +180,17 @@ local EXT_VALUES = {
     -- [skill_random] 技能池随机：故意用与文件内默认值不同的值（脚本默认是关闭 + 空池 = 全部预设）
     skill_preset_random_enabled = 1,
     skill_preset_pool_text = "ember_storm, frost_whiteout",
-    -- [reward_pool_1..6] 6 个独立奖池：故意用与文件内默认值不同的值（证明运行时以数据库为准）
-    reward_pool_1_enabled = 1, reward_pool_1_chance = 88, reward_pool_1_winner_mode = "all",
-    reward_pool_1_winner_count = 7, reward_pool_1_class_filter = 1, reward_pool_1_items_text = "11111,22222",
-    reward_pool_2_enabled = 0, reward_pool_2_chance = 77, reward_pool_2_winner_mode = "count",
-    reward_pool_2_winner_count = 6, reward_pool_2_class_filter = 0, reward_pool_2_items_text = "33333",
-    reward_pool_3_enabled = 1, reward_pool_3_chance = 66, reward_pool_3_winner_mode = "count",
-    reward_pool_3_winner_count = 5, reward_pool_3_class_filter = 1, reward_pool_3_items_text = "44444,55555",
-    reward_pool_4_enabled = 1, reward_pool_4_chance = 55, reward_pool_4_winner_mode = "all",
-    reward_pool_4_winner_count = 4, reward_pool_4_class_filter = 1, reward_pool_4_items_text = "66666",
-    reward_pool_5_enabled = 0, reward_pool_5_chance = 44, reward_pool_5_winner_mode = "count",
-    reward_pool_5_winner_count = 3, reward_pool_5_class_filter = 0, reward_pool_5_items_text = "77777,88888",
-    reward_pool_6_enabled = 1, reward_pool_6_chance = 33, reward_pool_6_winner_mode = "count",
-    reward_pool_6_winner_count = 2, reward_pool_6_class_filter = 1, reward_pool_6_items_text = "99999",
+    -- [recovery] 跨重启恢复：故意用与文件内默认值不同的值（脚本默认 15 秒 / 5%）
+    health_sample_interval_sec = 25, recovery_min_health_pct = 12,
+    boss_recovered_yell = "DB恢复喊话-{HEALTH_PCT}%",
+    -- [reward] 结算口径（奖池本体已不在 ext 表里：见 boss_reward_pools）
+    last_hit_only_qualifies = 0, offline_reward_delivery = 1,
     -- [schedule] 定时启停：故意用与文件内默认值不同的值（脚本默认是关闭 + 空时间段）
     activity_schedule_enabled = 1,
     activity_schedule_windows = "20:00-22:00; 1-5@08:00-09:00",
     activity_schedule_clear_on_close = 1,
+    -- 写入后的回读校验只取这一列（SELECT `updated_at` FROM ... LIMIT 1）
+    updated_at = 1756700000,
 }
 
 -- 模拟「扩展表已存在、但脚本升级后描述表多了列」的线上状态：
@@ -122,112 +202,177 @@ local PHASE_COLUMNS = {
     "phase3_summon_count", "phase2_spell_id", "phase3_spell_id",
 }
 
-local mockExtColumns = { state_key = true, updated_at = true }
-for column in pairs(EXT_VALUES) do mockExtColumns[column] = true end
-for _, column in ipairs(PHASE_COLUMNS) do mockExtColumns[column] = nil end
-
 -- 再模拟一次"脚本升级后描述表又多了定时启停三列"：加载时必须自动补列。
 local SCHEDULE_COLUMNS = {
     "activity_schedule_enabled", "activity_schedule_windows", "activity_schedule_clear_on_close",
 }
-for _, column in ipairs(SCHEDULE_COLUMNS) do mockExtColumns[column] = nil end
 
--- 再模拟一次"脚本升级后描述表又多了 6 个奖池的列"（每池抽几列模拟老库缺列）
-local REWARD_POOL_PROBE_COLUMNS = {
-    "reward_pool_1_items_text", "reward_pool_1_class_filter",
-    "reward_pool_4_items_text", "reward_pool_6_enabled", "reward_pool_6_items_text",
+-- 再模拟一次"脚本升级后描述表又多了 [recovery] / [reward] 结算口径五列"：同样必须自动补列。
+local RECOVERY_COLUMNS = {
+    "health_sample_interval_sec", "recovery_min_health_pct", "boss_recovered_yell",
 }
-for _, column in ipairs(REWARD_POOL_PROBE_COLUMNS) do mockExtColumns[column] = nil end
+local REWARD_SETTLEMENT_COLUMNS = { "last_hit_only_qualifies", "offline_reward_delivery" }
+local NEW_EXT_COLUMNS = {}
+for _, group in ipairs({ RECOVERY_COLUMNS, REWARD_SETTLEMENT_COLUMNS }) do
+    for _, column in ipairs(group) do NEW_EXT_COLUMNS[#NEW_EXT_COLUMNS + 1] = column end
+end
 
--- 运行态表的定时启停三列也按"老库还没有"处理（面板读不到时会降级显示，脚本自己要补）
-local mockRuntimeColumns = {
-    schedule_state = false, schedule_window = false, schedule_next_change_at = false,
+-- 列存在性状态：按表登记"老库还没有的列"，其余列（含主表里那些待 DROP 的历史列）一律当作存在。
+-- 三类 information_schema 查询都要能答：逐列 COLUMN_NAME = / 集合 COLUMN_NAME IN (...)
+-- （FetchExistingColumns 读的是**逐行返回的列名**，返回一个计数会让每个列都算缺）/ STATISTICS。
+local TABLE_NAMES = {
+    main = "boss_activity_config",
+    ext = "boss_activity_config_ext",
+    runtime = "boss_activity_runtime",
+    pools = "boss_reward_pools",
 }
+
+local mockMissingColumns = {
+    [TABLE_NAMES.main] = {},
+    [TABLE_NAMES.ext] = {},
+    -- 运行态表的定时启停三列也按"老库还没有"处理（面板读不到时会降级显示，脚本自己要补）
+    [TABLE_NAMES.runtime] = {
+        schedule_state = true, schedule_window = true, schedule_next_change_at = true,
+    },
+    [TABLE_NAMES.pools] = {},
+}
+
+local function markMissing(tableName, columns)
+    for _, column in ipairs(columns) do
+        mockMissingColumns[tableName][column] = true
+    end
+end
+
+markMissing(TABLE_NAMES.ext, PHASE_COLUMNS)
+markMissing(TABLE_NAMES.ext, SCHEDULE_COLUMNS)
+markMissing(TABLE_NAMES.ext, NEW_EXT_COLUMNS)
 
 local function mockInformationSchema(sql)
-    -- 只有扩展表的列状态是「脚本升级后缺列」的模拟状态；其它表按列齐全处理
-    if not sql:find("boss_activity_config_ext", 1, true) then
-        if sql:find("boss_activity_runtime", 1, true) then
-            local runtimeColumn = sql:match("COLUMN_NAME = '([%w_]+)'")
-            if runtimeColumn then
-                return mockQuery({ mockRuntimeColumns[runtimeColumn] and 1 or 0 })
-            end
-        end
-        return mockQuery({ 1 })
+    -- 索引存在性：一律按"已存在"处理（本脚本不校验索引 DDL 的列）
+    if sql:find("information_schema.STATISTICS", 1, true) then
+        return mockQuery({1})
     end
+
+    local tableName = sql:match("TABLE_NAME = '([%w_]+)'")
+    local missing = mockMissingColumns[tableName] or {}
 
     local inList = sql:match("COLUMN_NAME IN %((.-)%)")
     if inList then
-        local present = 0
+        local present = {}
         for name in inList:gmatch("'([%w_]+)'") do
-            if mockExtColumns[name] then present = present + 1 end
+            if not missing[name] then present[#present + 1] = name end
         end
-        return mockQuery({ present })
+
+        if sql:find("COUNT(*)", 1, true) then
+            return mockQuery({#present})
+        end
+
+        -- FetchExistingColumns 的形态：逐行返回"存在的列名"（一行一列）
+        local rows = {}
+        for _, name in ipairs(present) do rows[#rows + 1] = {name} end
+        return mockResultSet(rows)
     end
 
     local single = sql:match("COLUMN_NAME = '([%w_]+)'")
     if single then
-        return mockQuery({ mockExtColumns[single] and 1 or 0 })
+        return mockQuery({missing[single] and 0 or 1})
     end
 
-    return mockQuery({ 1 })
+    return mockQuery({1})
 end
 
--- 按 SELECT 里的列名组装一行数据；缺列直接判失败（描述表加了列而快照没跟上时立刻暴露）
-local function rowFromSelect(sql, values)
-    local columnsText = sql:match("SELECT%s+(.-)%s+FROM")
-    if not columnsText then
-        return nil
-    end
+-- ---------------------------------------------------------------- 运行态 / 奖池结果集
+-- 运行态整行的列顺序就是 LoadBossRuntimeFromDB 的 SELECT 顺序；快照按列名给出，缺列直接判失败。
+local RUNTIME_SELECT_COLUMNS = {
+    "boss_guid", "boss_entry", "boss_name", "map_id", "instance_id",
+    "home_x", "home_y", "home_z", "phase", "status", "respawn_at",
+    "last_spawn_at", "last_engage_at", "last_death_at", "last_reset_at",
+    "schedule_state", "schedule_window", "schedule_next_change_at",
+    "health_pct", "spawn_point_index", "last_health_sample_at",
+    "skill_preset", "skill_difficulty",
+}
 
+-- boss_reward_pools 的 SELECT 列顺序（同 LoadRewardPoolsFromDB）。
+local REWARD_POOL_SELECT_COLUMNS = {
+    "pool_id", "sort_order", "name", "enabled", "chance", "winner_mode",
+    "winner_count", "class_filter", "items_text", "gold_min_copper",
+    "gold_max_copper", "announce",
+}
+
+local function buildRow(columns, values, label)
     local row, missing = {}, {}
-    for column in columnsText:gmatch("`([%w_]+)`") do
-        local value = values[column]
-        if value == nil then
-            missing[#missing + 1] = column
-        end
-        row[#row + 1] = value
+    for index, column in ipairs(columns) do
+        if values[column] == nil then missing[#missing + 1] = column end
+        row[index] = values[column]
     end
-
     if #missing > 0 then
-        fail("数据库快照缺少列: " .. table.concat(missing, ", "))
+        fail(label .. "快照缺少列: " .. table.concat(missing, ", "))
     end
+    return row
+end
 
-    return mockQuery(row)
+-- 运行态快照：nil = 表里没有本区行（走"内存态/首次引导"分支）
+local function runtimeRow(values)
+    return buildRow(RUNTIME_SELECT_COLUMNS, values, "运行态")
+end
+
+-- 奖池快照：nil = 读不到（缺表）；{} = 空结果集（本脚本按"没有本区数据"处理）
+local function rewardPoolRows(list)
+    local rows = {}
+    for _, values in ipairs(list) do
+        rows[#rows + 1] = buildRow(REWARD_POOL_SELECT_COLUMNS, values, "奖池")
+    end
+    return rows
 end
 
 local env = setmetatable({}, { __index = _G })
 
 env.CharDBQuery = function(sql)
     table.insert(recorded.sql, { kind = "query", sql = sql })
-    if sql:find("information_schema") then
+
+    if sql:find("information_schema", 1, true) then
         return mockInformationSchema(sql)
     end
+    if sql:find("boss_reward_pools", 1, true) and sql:find("SELECT", 1, true) then
+        return recorded.rewardPoolRows and mockResultSet(recorded.rewardPoolRows) or nil
+    end
     if sql:find("boss_activity_config_ext", 1, true) and sql:find("SELECT", 1, true) then
-        return rowFromSelect(sql, EXT_VALUES)
+        return rowsFromSelect(sql, EXT_VALUES, "扩展表")
     end
     if sql:find("boss_activity_config", 1, true) and sql:find("SELECT", 1, true) then
-        return rowFromSelect(sql, CONFIG_VALUES)
+        return rowsFromSelect(sql, CONFIG_VALUES, "主表")
     end
-    return nil -- runtime / 其它：模拟“没有行”
+    if sql:find("boss_activity_runtime", 1, true) and sql:find("SELECT", 1, true) then
+        -- 整行读取（SELECT 里带 boss_guid）默认"没有行"；只取 status 的是写入后的回读校验
+        if sql:find("`boss_guid`", 1, true) then
+            return recorded.runtimeRow and mockResultSet({recorded.runtimeRow}) or nil
+        end
+        return mockQuery({"idle"})
+    end
+    return nil -- 其它：模拟"没有行"
 end
 
 env.CharDBExecute = function(sql)
     table.insert(recorded.sql, { kind = "execute", sql = sql })
 
+    -- 写库失败可见性（§写库统一入口）用：让下一次写抛错，模拟"Lua 侧语句拼接异常"
+    if recorded.failNextExecute then
+        recorded.failNextExecute = false
+        error("injected CharDBExecute failure")
+    end
+
     -- 补列必须真的改变「表结构」，否则后面的查询/写入还是按缺列状态走
     local addedColumn = sql:match("ADD COLUMN `([%w_]+)`")
     if addedColumn then
-        if sql:find("boss_activity_runtime", 1, true) then
-            if mockRuntimeColumns[addedColumn] == true then
-                fail("重复补列(runtime): " .. addedColumn)
-            end
-            mockRuntimeColumns[addedColumn] = true
+        local tableName = sql:match("ALTER TABLE `[^`]+`%.`([%w_]+)`")
+        local missing = mockMissingColumns[tableName]
+        if missing == nil then
+            fail("补列语句指向未知表: " .. tostring(tableName) .. "（" .. sql:sub(1, 120) .. "）")
         else
-            if mockExtColumns[addedColumn] then
-                fail("重复补列: " .. addedColumn)
+            if missing[addedColumn] ~= true then
+                fail("重复补列(" .. tostring(tableName) .. "): " .. addedColumn)
             end
-            mockExtColumns[addedColumn] = true
+            missing[addedColumn] = nil
         end
         recorded.alters[#recorded.alters + 1] = addedColumn
         recorded.altersSql = recorded.altersSql or {}
@@ -260,6 +405,16 @@ env.RegisterPlayerEvent = function(ev, fn)
     engineCallbacks.player[tostring(ev)] = fn
 end
 env.GetConfigValue = function() return 1 end
+-- 离线补发走全局 SendMail（按 GUID 投递，玩家不在线也进邮箱）：只记录调用参数供断言
+env.SendMail = function(subject, text, receiverGUIDLow, senderGUIDLow, stationery, delay, money, cod, itemId, itemCount)
+    recorded.mails[#recorded.mails + 1] = {
+        subject = subject, text = text,
+        receiverGUIDLow = receiverGUIDLow, senderGUIDLow = senderGUIDLow,
+        stationery = stationery, delay = delay,
+        money = money, cod = cod, itemId = itemId, itemCount = itemCount,
+    }
+    return true
+end
 
 local function runConsoleCommand(command)
     local handler = {
@@ -283,6 +438,56 @@ local function markersOf(messages)
     return table.concat(markers, ","), text
 end
 
+-- ------------------------------------------- 从 INSERT 里按列名取一个值（断言贡献快照用）
+-- 不能靠"第几个数字"猜：列会增删，而 VALUES 里的字符串还可能含逗号。
+local function splitSqlValues(valuesText)
+    local values, current, inQuote, index = {}, {}, false, 1
+    while index <= #valuesText do
+        local character = valuesText:sub(index, index)
+        if inQuote then
+            if character == "'" then
+                if valuesText:sub(index + 1, index + 1) == "'" then
+                    current[#current + 1] = "'"
+                    index = index + 1
+                else
+                    inQuote = false
+                    current[#current + 1] = character
+                end
+            else
+                current[#current + 1] = character
+            end
+        elseif character == "'" then
+            inQuote = true
+            current[#current + 1] = character
+        elseif character == "," then
+            values[#values + 1] = table.concat(current)
+            current = {}
+        else
+            current[#current + 1] = character
+        end
+        index = index + 1
+    end
+    values[#values + 1] = table.concat(current)
+    return values
+end
+
+local function insertColumnValue(sql, column)
+    local columnsText = sql:match("%((.-)%) VALUES")
+    if columnsText == nil then return nil end
+
+    local position, wanted = 0, nil
+    for name in columnsText:gmatch("`([%w_]+)`") do
+        position = position + 1
+        if name == column then wanted = position end
+    end
+    if wanted == nil then return nil end
+
+    local valuesText = sql:match("VALUES%s*%((.*)%)%s*;?%s*$")
+    if valuesText == nil then return nil end
+
+    return splitSqlValues(valuesText)[wanted]
+end
+
 -- ------------------------------------------------------------------- 加载脚本
 io.write("== 加载 " .. bossPath .. " ==\n")
 local chunk, loadErr = loadfile(bossPath, "t", env)
@@ -291,7 +496,12 @@ if not chunk then
     os.exit(2)
 end
 
-local runOk, runErr = pcall(chunk)
+-- 全局 print 在跑 chunk 期间换成录制器：boss.lua 的 basePrint 就是这一刻的 print，
+-- 之后它所有日志（含加载期的奖池来源 / 列契约自检 / 跨重启恢复检测）都会落进 recorded.logLines。
+local runOk, runErr
+captureGlobalPrint(function()
+    runOk, runErr = pcall(chunk)
+end)
 if not runOk then
     io.write("RUNTIME ERROR during load: " .. tostring(runErr) .. "\n")
     os.exit(2)
@@ -301,6 +511,9 @@ ok("脚本加载执行完成（EnsureBossSchema / LoadBossConfigFromDB / LoadBos
 -- --------------------------------------------------------------- 回归断言 1/2
 assertTrue(print == originalPrint and rawget(env, "print") == nil,
     "全局 print 未被 boss.lua 覆盖（其它 Eluna 脚本不受影响）")
+assertTrue(#recorded.logLines > 0,
+    "能捕获 boss.lua 的日志输出（" .. #recorded.logLines
+        .. " 行；打不开 lua_scripts/lua_logs/boss.log 时才会回落到 stdout，请在无该目录的工作目录下运行）")
 assertTrue(rawget(env, "RegisterBossEventsForEntry") == nil and rawget(env, "RegisterBossEventsForCandidates") == nil,
     "RegisterBossEventsFor* 不再泄漏为全局变量")
 assertTrue(rawget(env, "activeBossInfo") == nil and rawget(env, "IsManagedBossEntry") == nil,
@@ -542,6 +755,11 @@ end
 assertTrue(replaceConfigWrites == 0, "配置表写入不再使用 REPLACE INTO（避免清掉面板列）")
 
 -- 扩展表：建表语句与写入语句的列都必须和描述表一致（防止「描述表加了、DDL 忘了加」）
+local extSchema = bossLocal("BOSS_CONFIG_SCHEMA_EXT")
+local mainSchema = bossLocal("BOSS_CONFIG_SCHEMA_MAIN")
+assertTrue(type(extSchema) == "table" and type(mainSchema) == "table",
+    "按名字取到文件内 local BOSS_CONFIG_SCHEMA_MAIN / BOSS_CONFIG_SCHEMA_EXT（列数断言的数据源）")
+
 if extCreateSql and extInsertSql then
     local createColumns = {}
     local createBody = extCreateSql:match("%((.*)%) ENGINE") or ""
@@ -558,7 +776,10 @@ if extCreateSql and extInsertSql then
         end
     end
 
-    assertTrue(insertColumnCount >= 32, "扩展表写入覆盖所有配置列（当前 " .. insertColumnCount .. " 列）")
+    -- 引导写入 = state_key + 描述表全部列 + updated_at
+    assertEq(insertColumnCount, (type(extSchema) == "table" and #extSchema or 0) + 2,
+        "扩展表写入覆盖描述表全部列（" .. tostring(type(extSchema) == "table" and #extSchema or 0)
+            .. " 个描述项 + state_key + updated_at）")
     assertTrue(#missingInCreate == 0,
         "扩展表写入的每一列都在建表语句里" .. (#missingInCreate > 0 and ("（缺: " .. table.concat(missingInCreate, ",") .. "）") or ""))
 
@@ -569,6 +790,25 @@ if extCreateSql and extInsertSql then
     }) do
         assertTrue(createColumns[column] == true, "扩展表建表语句含列 " .. column)
     end
+
+    -- 五个新列（[recovery] 三列 + [reward] 结算口径两列）必须同时进建表与引导写入
+    for _, column in ipairs(NEW_EXT_COLUMNS) do
+        assertTrue(createColumns[column] == true, "扩展表建表语句含新列 " .. column)
+        assertTrue(extInsertSql:find("`" .. column .. "`", 1, true) ~= nil,
+            "扩展表引导写入含新列 " .. column)
+    end
+
+    -- 奖池已经搬进 boss_reward_pools 表：ext 表里不允许再出现 reward_pool_N_* 列
+    local stalePoolColumns = {}
+    for column in pairs(createColumns) do
+        if column:match("^reward_pool_%d+_") then stalePoolColumns[#stalePoolColumns + 1] = column end
+    end
+    for column in insertColumnsText:gmatch("`([%w_]+)`") do
+        if column:match("^reward_pool_%d+_") then stalePoolColumns[#stalePoolColumns + 1] = column end
+    end
+    assertTrue(#stalePoolColumns == 0,
+        "扩展表已无 reward_pool_N_* 列（旧奖池的 36 个配置列彻底移出配置表）"
+        .. (#stalePoolColumns > 0 and ("（仍有: " .. table.concat(stalePoolColumns, ",") .. "）") or ""))
 end
 
 local runtimeWrites = 0
@@ -579,17 +819,59 @@ for _, item in ipairs(recorded.sql) do
 end
 assertTrue(runtimeWrites >= 1, "启动时写入了 boss_activity_runtime 引导行")
 
--- 扩展表迁移：桩状态里故意缺 12 个 [phase] 列，加载时必须先补列再写配置，
+-- 扩展表迁移：桩状态里故意缺 [phase] 12 列 + [schedule] 3 列 + [recovery]/[reward] 5 列，
+-- 运行态表缺 [schedule] 3 列；加载时必须先补列再写配置，
 -- 否则线上遇到「脚本升级后描述表多了列」会整条写入失败（配置改了却不生效）
 io.write("\n== 扩展表缺列迁移 ==\n")
-assertTrue(#recorded.alters >= #PHASE_COLUMNS,
-    string.format("自动补列 %d 个（缺 %d 个 [phase] 列）", #recorded.alters, #PHASE_COLUMNS))
-local missingPhaseColumns = {}
-for _, column in ipairs(PHASE_COLUMNS) do
-    if not mockExtColumns[column] then missingPhaseColumns[#missingPhaseColumns + 1] = column end
+do
+-- 本区 key 从**被测文件**里读：多区部署由 deploy-realm.ps1 改写这两行常量，
+-- 断言里写死 'current' 会让"key 不是 current 的区"永远失败（而每个区都必须是不同的 key）。
+local expectedConfigKey, expectedRuntimeKey = "current", "current"
+do
+    local handle = io.open(bossPath, "r")
+    if handle then
+        local text = handle:read("*a")
+        handle:close()
+        expectedConfigKey = text:match('local BOSS_CONFIG_KEY%s*=%s*"([^"]*)"') or expectedConfigKey
+        expectedRuntimeKey = text:match('local BOSS_RUNTIME_KEY%s*=%s*"([^"]*)"') or expectedRuntimeKey
+    end
 end
-assertTrue(#missingPhaseColumns == 0,
-    "补列后扩展表列齐全" .. (#missingPhaseColumns > 0 and ("（缺: " .. table.concat(missingPhaseColumns, ",") .. "）") or ""))
+assertTrue(expectedConfigKey ~= "" and expectedRuntimeKey ~= "",
+    "从被测文件里读到 BOSS_CONFIG_KEY / BOSS_RUNTIME_KEY（多区部署会改写它们）")
+
+local expectedAlters = #PHASE_COLUMNS + #SCHEDULE_COLUMNS + #NEW_EXT_COLUMNS + 3
+assertEq(#recorded.alters, expectedAlters,
+    string.format("自动补列 %d 个（缺 [phase] %d + [schedule] %d + 新列 %d + 运行态 %d）",
+        expectedAlters, #PHASE_COLUMNS, #SCHEDULE_COLUMNS, #NEW_EXT_COLUMNS, 3))
+
+for tableName, label in pairs({ [TABLE_NAMES.ext] = "扩展表", [TABLE_NAMES.runtime] = "运行态表" }) do
+    local stillMissing = {}
+    for column in pairs(mockMissingColumns[tableName]) do
+        stillMissing[#stillMissing + 1] = column
+    end
+    assertTrue(#stillMissing == 0,
+        "补列后" .. label .. "列齐全" .. (#stillMissing > 0 and ("（缺: " .. table.concat(stillMissing, ",") .. "）") or ""))
+end
+
+-- 新列必须真的被 ALTER 过，而且带 AFTER（物理列序与描述表一致，DBA 复核 / 面板镜像都按这个顺序）
+for _, column in ipairs(NEW_EXT_COLUMNS) do
+    local alterSql = nil
+    for _, sql in ipairs(recorded.altersSql or {}) do
+        if sql:find("ADD COLUMN `" .. column .. "`", 1, true) then alterSql = sql end
+    end
+    assertTrue(alterSql ~= nil, "老库缺列时自动 ALTER 补列 " .. column)
+    if alterSql ~= nil then
+        assertTrue(alterSql:find("AFTER `", 1, true) ~= nil,
+            "补列 " .. column .. " 带 AFTER（插到描述表里的位置，物理列序与面板镜像一致）")
+    end
+end
+
+local healthAlter = nil
+for _, sql in ipairs(recorded.altersSql or {}) do
+    if sql:find("ADD COLUMN `health_sample_interval_sec`", 1, true) then healthAlter = sql end
+end
+assertTrue(healthAlter ~= nil and healthAlter:find("AFTER `skill_preset_pool_text`", 1, true) ~= nil,
+    "health_sample_interval_sec 补在 skill_preset_pool_text 之后（[recovery] 组插在 [schedule] 之前）")
 
 local firstAlterIndex, firstExtInsertIndex = nil, nil
 for index, item in ipairs(recorded.sql) do
@@ -604,7 +886,57 @@ end
 assertTrue(firstAlterIndex ~= nil and firstExtInsertIndex ~= nil and firstAlterIndex < firstExtInsertIndex,
     "补列发生在扩展表写入之前（顺序：ALTER → INSERT）")
 
+-- ------------------------------------------------- 整行读取的列契约（运行态 / 奖池）
+-- 这两张表的快照是"按列名"给出的，靠列顺序对齐；boss.lua 一改 SELECT 列就必须在这里暴露，
+-- 否则 GetQuery*(query, index) 会静默错位（读成隔壁字段的值）。
+local function selectColumnsOf(sql)
+    local text = sql:match("SELECT%s+(.-)%s+FROM") or ""
+    local columns = {}
+    for column in text:gmatch("`([%w_]+)`") do columns[#columns + 1] = column end
+    return columns
+end
+
+local runtimeSelectSql, rewardPoolSelectSql = nil, nil
+for _, item in ipairs(recorded.sql) do
+    -- 只认整行 SELECT：同一批里还有 CREATE TABLE / information_schema 的列契约查询
+    if item.kind == "query" and item.sql:find("SELECT", 1, true)
+        and item.sql:find("CREATE", 1, true) == nil
+        and item.sql:find("COLUMN_NAME", 1, true) == nil then
+        if item.sql:find("`boss_activity_runtime`", 1, true) and item.sql:find("`health_pct`", 1, true)
+            and runtimeSelectSql == nil then
+            runtimeSelectSql = item.sql
+        end
+        if item.sql:find("`boss_reward_pools`", 1, true) and item.sql:find("`items_text`", 1, true)
+            and rewardPoolSelectSql == nil then
+            rewardPoolSelectSql = item.sql
+        end
+    end
+end
+
+assertTrue(runtimeSelectSql ~= nil, "启动时按整行读取 boss_activity_runtime（跨重启恢复依赖它）")
+if runtimeSelectSql ~= nil then
+    assertEq(table.concat(selectColumnsOf(runtimeSelectSql), ","), table.concat(RUNTIME_SELECT_COLUMNS, ","),
+        "运行态 SELECT 的列与冒烟快照顺序一致（" .. #RUNTIME_SELECT_COLUMNS .. " 列，含 health_pct/spawn_point_index/技能预设）")
+    assertTrue(runtimeSelectSql:find(expectedRuntimeKey, 1, true) ~= nil,
+        "运行态查询用本区 key（" .. expectedRuntimeKey .. "）过滤")
+end
+
+assertTrue(rewardPoolSelectSql ~= nil, "启动时会从 boss_reward_pools 读奖池（不是 ext 配置列）")
+if rewardPoolSelectSql ~= nil then
+    assertEq(table.concat(selectColumnsOf(rewardPoolSelectSql), ","), table.concat(REWARD_POOL_SELECT_COLUMNS, ","),
+        "奖池 SELECT 的列与冒烟快照顺序一致（" .. #REWARD_POOL_SELECT_COLUMNS .. " 列）")
+    -- key 取自被测文件（deploy-realm 会改写），不写死 'current'
+    assertTrue(rewardPoolSelectSql:find("`state_key` = '" .. expectedConfigKey .. "'", 1, true) ~= nil,
+        "奖池查询按本区 state_key 过滤（" .. expectedConfigKey .. "，多区共用库）")
+    assertTrue(rewardPoolSelectSql:find("`deleted_at` = 0", 1, true) ~= nil,
+        "奖池查询排除软删除行（deleted_at = 0；pool_id 不复用）")
+    assertTrue(rewardPoolSelectSql:find("ORDER BY `sort_order`, `pool_id`", 1, true) ~= nil,
+        "奖池查询按 sort_order / pool_id 排序（面板拖拽顺序即生效顺序）")
+end
+end
+
 -- ------------------------------------------------------------ 命令驱动与断言
+do
 local cases = {
     { cmd = "boss help",              expect = "AGMP_OK",    name = ".boss help" },
     { cmd = "boss config reload",     expect = "AGMP_OK",    name = ".boss config reload" },
@@ -615,6 +947,7 @@ local cases = {
     { cmd = "boss kill",              expect = "AGMP_ERROR", name = ".boss kill（无活跃 Boss）" },
     { cmd = "boss clear",             expect = "AGMP_OK",    name = ".boss clear（无活跃 Boss）" },
     { cmd = "boss schedule",          expect = "AGMP_OK",    name = ".boss schedule" },
+    { cmd = "boss pools",             expect = "AGMP_OK",    name = ".boss pools" },
     { cmd = "boss spawn",             expect = "AGMP_ERROR", name = ".boss spawn（定时计划在时段外 → 拒绝）" },
     { cmd = "boss spawn force",       expect = "AGMP_ERROR", name = ".boss spawn force（桩生成失败）" },
     { cmd = "boss nonsense",          expect = "AGMP_ERROR", name = ".boss 未知子命令" },
@@ -629,6 +962,7 @@ for _, case in ipairs(cases) do
     assertTrue(markers:find(case.expect, 1, true) ~= nil,
         case.name .. " 返回 " .. case.expect .. "（面板可据此判定成功/失败）")
 end
+end
 
 -- 配置展示 + 「运行时以数据库为准」：ext 表里的值必须真的生效，而不是被默认值盖掉
 io.write("\n== .boss config show ==\n")
@@ -638,22 +972,36 @@ assertTrue(#groupMessages > 0, ".boss config show 有输出")
 local groupKeys = {
     "identity", "basic", "ally", "yells", "taunts", "ai", "phase", "patrol",
     "minion", "skill", "skill_random", "respawn", "spawnpoints", "schedule",
-    "helper", "reward", "reward_pool_1", "reward_pool_2", "reward_pool_3",
-    "reward_pool_4", "reward_pool_5", "reward_pool_6", "class_ai", "class_reward", "tier",
+    "helper", "reward", "recovery", "class_ai", "class_reward", "tier",
 }
 local missingGroups = {}
 for _, group in ipairs(groupKeys) do
     if not groupText:find(group, 1, true) then missingGroups[#missingGroups + 1] = group end
 end
-assertTrue(#missingGroups == 0, "配置分组齐全（25 组：含 6 个独立奖池 + 拆开的职业两组）" ..
+assertTrue(#missingGroups == 0, "配置分组齐全（20 组：含新增 recovery 与拆开的职业两组）" ..
     (#missingGroups > 0 and ("（缺: " .. table.concat(missingGroups, ",") .. "）") or ""))
 
--- 各组声明的项数之和必须等于描述表总数（漏登记会立刻暴露）
-local listedTotal = 0
+-- 奖池不再是配置列：不能再出现 reward_pool_N 分组
+local staleGroups = {}
+for _, group in ipairs({ "reward_pool_1", "reward_pool_2", "reward_pool_3", "reward_pool_4", "reward_pool_5", "reward_pool_6" }) do
+    if groupText:find(group, 1, true) then staleGroups[#staleGroups + 1] = group end
+end
+assertTrue(#staleGroups == 0, "配置分组里已无 6 个奖池组（奖池改由 boss_reward_pools 表维护）" ..
+    (#staleGroups > 0 and ("（仍有: " .. table.concat(staleGroups, ",") .. "）") or ""))
+
+assertEq(#groupKeys, 20, "分组清单常量与 boss.lua 的 BOSS_CONFIG_GROUP_ORDER 一致（20 组）")
+
+-- 各组声明的项数之和必须等于两张描述表的项数之和（漏登记/漏分组会立刻暴露）
+local listedTotal, listedGroupCount = 0, 0
 for count in groupText:gmatch("（(%d+) 项）") do
     listedTotal = listedTotal + tonumber(count)
+    listedGroupCount = listedGroupCount + 1
 end
-assertTrue(listedTotal >= 100, "分组项数之和覆盖全部配置项（当前 " .. listedTotal .. "）")
+assertEq(listedGroupCount, #groupKeys, "展示出的有项分组数与预期一致")
+if type(extSchema) == "table" and type(mainSchema) == "table" then
+    assertEq(listedTotal, #mainSchema + #extSchema,
+        string.format("分组项数之和 = 描述表总数（主表 %d + 扩展表 %d）", #mainSchema, #extSchema))
+end
 
 local function showGroup(group)
     return table.concat(runConsoleCommand("boss config show " .. group), " | ")
@@ -711,6 +1059,22 @@ assertTrue(phaseText:find("phase3_summon_count (phase3SummonCount) = 5", 1, true
 assertTrue(phaseText:find("target_reeval_loops (targetReevalLoops) = 4", 1, true) ~= nil,
     "目标重评估间隔 targetReevalLoops 取自 ext 表")
 
+-- [recovery] 跨重启恢复（新组）：三列都必须来自 ext 表
+local recoveryText = showGroup("recovery")
+assertTrue(recoveryText:find("health_sample_interval_sec (healthSampleIntervalSec) = 25", 1, true) ~= nil,
+    "[recovery] 血量采样间隔取自 ext 表")
+assertTrue(recoveryText:find("recovery_min_health_pct (recoveryMinHealthPct) = 12", 1, true) ~= nil,
+    "[recovery] 恢复血量下限取自 ext 表")
+assertTrue(recoveryText:find("boss_recovered_yell (bossRecoveredYell) = DB恢复喊话-{HEALTH_PCT}%", 1, true) ~= nil,
+    "[recovery] 恢复喊话取自 ext 表（{HEALTH_PCT} 占位符原样保留）")
+
+-- [reward] 结算口径两列（奖池本体已移出 ext 表）
+local rewardSettlementText = showGroup("reward")
+assertTrue(rewardSettlementText:find("last_hit_only_qualifies (lastHitOnlyQualifies) = false", 1, true) ~= nil,
+    "[reward] last_hit_only_qualifies=0 解析为 false（只有最后一击不算有效参战）")
+assertTrue(rewardSettlementText:find("offline_reward_delivery (offlineRewardDelivery) = true", 1, true) ~= nil,
+    "[reward] offline_reward_delivery=1 解析为 true（下线玩家走邮件补发）")
+
 local badGroupMessages = runConsoleCommand("boss config show nonsense")
 local badMarkers = markersOf(badGroupMessages)
 assertTrue(badMarkers:find("AGMP_ERROR", 1, true) ~= nil, "未知配置分组返回 AGMP_ERROR")
@@ -720,6 +1084,7 @@ assertTrue(badUsage:find("AGMP_ERROR", 1, true) ~= nil, ".boss config <未知子
 
 -- 非 boss 命令必须放行（返回 true 表示交给核心继续处理）
 io.write("\n== 非 boss 命令放行 ==\n")
+do
 local handler = { messages = {}, SendSysMessage = function(self, m) table.insert(self.messages, m) end }
 local passthrough = engineCallbacks.player["42"](42, nil, "reload ale", handler)
 assertTrue(passthrough == true, "非 boss 命令返回 true（不拦截其他 GM 指令）")
@@ -754,6 +1119,7 @@ end
 -- 它也被注册事件，说明「受管模板」确实以数据库为准
 assertTrue(engineCallbacks.creature["190094/1"] ~= nil,
     "受管模板 entry 由 ext 表驱动（190094 也注册了事件）")
+end
 
 -- ------------------------------------------------- 定时启停（每天时间段自动开关）
 -- 三件事必须成立：
@@ -761,7 +1127,7 @@ assertTrue(engineCallbacks.creature["190094/1"] ~= nil,
 --   2) 时间段解析与命中判定按「星期掩码 + 跨夜」正确（用可控时钟驱动 tick 断言）；
 --   3) 门控真的生效：时段外不生成、进入时段自动补生成、离开时段写结束事件。
 io.write("\n== 定时启停（时间段） ==\n")
-
+do
 local scheduleColumns = {
     "activity_schedule_enabled", "activity_schedule_windows", "activity_schedule_clear_on_close",
 }
@@ -788,11 +1154,14 @@ end
 assertTrue(runtimeScheduleColumns, "runtime 写入语句含定时启停三列（面板读同一行显示）")
 
 -- 自动补列：线上老库（扩展表 + 运行态表）都没有这三列，加载时必须先 ALTER 再读写
+-- （断言依据是"补列时桩状态里的缺列真的被清掉了"，见上面 == 扩展表缺列迁移 == 一节）
 for _, column in ipairs(scheduleColumns) do
-    assertTrue(mockExtColumns[column] == true, "加载时自动补扩展表列 " .. column)
+    assertTrue(mockMissingColumns[TABLE_NAMES.ext][column] == nil,
+        "加载时自动补扩展表列 " .. column)
 end
-for column in pairs(mockRuntimeColumns) do
-    assertTrue(mockRuntimeColumns[column] == true, "加载时自动补运行态列 " .. tostring(column))
+for _, column in ipairs({ "schedule_state", "schedule_window", "schedule_next_change_at" }) do
+    assertTrue(mockMissingColumns[TABLE_NAMES.runtime][column] == nil,
+        "加载时自动补运行态列 " .. column)
 end
 
 -- 组内取值必须来自 ext 表（面板保存的就是这三列）
@@ -879,12 +1248,19 @@ if scheduleTick then
     end
     assertTrue(not repeatedEvent, "状态没翻转时不重复写 schedule_open 事件")
 
-    -- 4) 离开时间段：写 schedule_close，运行态回到 closed
+    -- 4) 离开时间段：写 schedule_close，运行态回到 closed，且残留的重生倒计时必须被收敛为 0
     recorded.spawnAttempts = 0
     local beforeClose = #recorded.sql
     setNow(outsideNight)
+    -- 制造一个"上一次排重生留下的倒计时"：关窗分支必须把它清零（否则面板上停着一个永不到点的倒计时）
+    local liveRuntimeState = bossLocal("bossRuntimeState")
+    assertTrue(type(liveRuntimeState) == "table", "取到文件内 local bossRuntimeState（制造残留 respawn_at 用）")
+    if type(liveRuntimeState) == "table" then liveRuntimeState.respawnAt = 4242 end
     scheduleTick(0, 1000, 0)
     assertTrue(recorded.spawnAttempts == 0, "离开时间段不会生成 Boss")
+    if type(liveRuntimeState) == "table" then
+        assertEq(liveRuntimeState.respawnAt, 0, "关窗分支把残留 respawn_at 收敛为 0（面板不会显示永不到点的倒计时）")
+    end
 
     local closeEvent, closedAgain = false, false
     for index = beforeClose + 1, #recorded.sql do
@@ -907,6 +1283,7 @@ if scheduleTick then
     runConsoleCommand("boss spawn force")
     assertTrue(recorded.spawnAttempts == 1, ".boss spawn force 绕过定时计划（调试用）")
 end
+end
 
 -- ------------------------------------------------- 技能池随机（每次刷新抽一套预设）
 -- 三件事必须成立：
@@ -914,7 +1291,7 @@ end
 --   2) 开启后每次生成都从池子里抽（每次都在池内，且多次生成会抽到不同的预设）；
 --   3) 关闭后生成不再抽签（固定用当前预设），命令行开关会写回扩展表。
 io.write("\n== 技能池随机（每次刷新抽一套预设） ==\n")
-
+do
 local skillRandomColumns = { "skill_preset_random_enabled", "skill_preset_pool_text" }
 for _, column in ipairs(skillRandomColumns) do
     if extCreateSql then
@@ -1365,39 +1742,14 @@ if type(applySkillPreset) == "function" and type(applySkillDifficulty) == "funct
     local restoredChains = scaledComboChains()
     assertTrue(type(restoredChains) == "table" and #restoredChains > 0, "复原后缩放连招表仍非空")
 end
+end
 
--- ------------------------------------------------- 6 个独立奖池（旧奖励模型已删除）
+-- ------------------------------------------------- 奖池（boss_reward_pools 表驱动）
 -- 三件事必须成立：
---   1) 每池 6 列都进了扩展表建表/引导写入，老库缺列时自动补；
---   2) 旧奖励模型的列（保底/基础/公式/坐骑/金币）从主表 DROP 掉，建表语句里也不再有它们；
---   3) 面板读到的池配置确实来自数据库（.boss config show reward_pool_N）。
-io.write("\n== 6 个独立奖池 ==\n")
-
-local poolColumns = {}
-for index = 1, 6 do
-    for _, suffix in ipairs({ "enabled", "chance", "winner_mode", "winner_count", "class_filter", "items_text" }) do
-        poolColumns[#poolColumns + 1] = string.format("reward_pool_%d_%s", index, suffix)
-    end
-end
-assertTrue(#poolColumns == 36, "奖池列共 36 个（6 池 × 6 字段）")
-
-local poolColumnMissing = {}
-for _, column in ipairs(poolColumns) do
-    if extCreateSql and not extCreateSql:find("`" .. column .. "`", 1, true) then
-        poolColumnMissing[#poolColumnMissing + 1] = "DDL:" .. column
-    end
-    if extInsertSql and not extInsertSql:find("`" .. column .. "`", 1, true) then
-        poolColumnMissing[#poolColumnMissing + 1] = "INSERT:" .. column
-    end
-end
-assertTrue(#poolColumnMissing == 0, "扩展表建表 + 引导写入覆盖 36 个奖池列" ..
-    (#poolColumnMissing > 0 and ("（缺: " .. table.concat(poolColumnMissing, ",") .. "）") or ""))
-
-local missingPoolProbe = {}
-for _, column in ipairs(REWARD_POOL_PROBE_COLUMNS) do
-    if mockExtColumns[column] ~= true then missingPoolProbe[#missingPoolProbe + 1] = column end
-end
-assertTrue(#missingPoolProbe == 0, "老库缺奖池列时自动补列（" .. table.concat(REWARD_POOL_PROBE_COLUMNS, ", ") .. "）")
+--   1) 36 个 reward_pool_N_* 描述列彻底消失（ext 建表 / 引导写入都不再有它们，见上面 == 扩展表 == 一节）；
+--   2) 旧奖励模型的 13 个列从主表 DROP 掉，建表语句里也不再有它们；
+--   3) 没有本区奖池数据时回退出厂默认（来源 code），有数据时一律以表为准（.boss pools 与结算都读同一份）。
+io.write("\n== 奖池（表驱动） ==\n")
 
 -- 旧奖励模型的列必须被 DROP（连数据一起删）
 local legacyColumns = {
@@ -1441,53 +1793,15 @@ if mainCreateSql then
         "主表仍保留选人相关列（random_reward_mode / participation_range / *_weight）")
 end
 
--- 面板读到的奖池值确实来自数据库
-local poolExpect = {
-    { 1, {
-        "reward_pool_1_enabled (1.enabled) = true",
-        "reward_pool_1_chance (1.chance) = 88",
-        "reward_pool_1_winner_mode (1.winnerMode) = all",
-        "reward_pool_1_winner_count (1.winnerCount) = 7",
-        "reward_pool_1_class_filter (1.classFilter) = true",
-        "reward_pool_1_items_text (1.items) = 11111,22222",
-    } },
-    { 2, {
-        "reward_pool_2_enabled (2.enabled) = false",
-        "reward_pool_2_chance (2.chance) = 77",
-        "reward_pool_2_winner_mode (2.winnerMode) = count",
-        "reward_pool_2_winner_count (2.winnerCount) = 6",
-        "reward_pool_2_class_filter (2.classFilter) = false",
-        "reward_pool_2_items_text (2.items) = 33333",
-    } },
-    { 6, {
-        "reward_pool_6_enabled (6.enabled) = true",
-        "reward_pool_6_chance (6.chance) = 33",
-        "reward_pool_6_winner_mode (6.winnerMode) = count",
-        "reward_pool_6_winner_count (6.winnerCount) = 2",
-        "reward_pool_6_class_filter (6.classFilter) = true",
-        "reward_pool_6_items_text (6.items) = 99999",
-    } },
-}
-for _, case in ipairs(poolExpect) do
-    local text = showGroup("reward_pool_" .. case[1])
-    local missing = {}
-    for _, expected in ipairs(case[2]) do
-        if not text:find(expected, 1, true) then missing[#missing + 1] = expected end
-    end
-    assertTrue(#missing == 0, "奖池 " .. case[1] .. " 的开关/概率/人数模式/人数/职业过滤/奖品都来自数据库" ..
-        (#missing > 0 and ("（缺: " .. table.concat(missing, " | ") .. "）") or ""))
-end
-
-assertTrue(showGroup("reward_pool_3"):find("44444,55555", 1, true) ~= nil, "奖池 3 的奖品列表来自数据库")
-
--- reward 组只剩"谁算有效参战 / 怎么抽人"
+-- reward 组只剩"谁算有效参战 / 怎么抽人" + 两个结算口径开关
 local rewardText = showGroup("reward")
 assertTrue(rewardText:find("participation_range (participationRange) = 80", 1, true) ~= nil,
     "reward 组仍显示有效参与范围")
 assertTrue(rewardText:find("guaranteed_reward_enabled", 1, true) == nil
     and rewardText:find("reward_items_text", 1, true) == nil
-    and rewardText:find("gold_min_copper", 1, true) == nil,
-    "reward 组不再包含旧奖励字段（保底 / 基础池 / 金币）")
+    and rewardText:find("gold_min_copper", 1, true) == nil
+    and rewardText:find("reward_pool_1", 1, true) == nil,
+    "reward 组不再包含旧奖励字段与 6 个奖池字段（保底 / 基础池 / 金币 / reward_pool_N）")
 
 -- 职业奖励池映射保留（奖池的 classFilter 依赖它）
 assertTrue(showGroup("class_reward"):find("class_reward_items_text", 1, true) ~= nil,
@@ -1495,41 +1809,140 @@ assertTrue(showGroup("class_reward"):find("class_reward_items_text", 1, true) ~=
 assertTrue(extInsertSql ~= nil and extInsertSql:find("`class_reward_items_text`", 1, true) ~= nil,
     "职业奖励池映射仍参与引导写入")
 
+-- ------------------------------------------------ 奖池运行期来源（没有表数据 → 回退出厂默认）
+-- REWARD_POOLS_SOURCE 在 boss.lua 里可能是文件内 local（按上值名取样），也可能是全局（落在 env 表里）
+local function rewardPoolsSource()
+    local localValue = bossLocal("REWARD_POOLS_SOURCE")
+    if localValue ~= nil then return localValue end
+    return rawget(env, "REWARD_POOLS_SOURCE")
+end
+
+local rewardPools = bossLocal("REWARD_POOLS")
+assertTrue(type(rewardPools) == "table", "取到文件内 local REWARD_POOLS（运行期奖池表）")
+assertEq(rewardPoolsSource(), "code",
+    "读不到 boss_reward_pools 数据时来源标记为 code（回退出厂默认，活动不会因配置表异常停摆）")
+
+local poolSourceLog = findLogLine("[奖池]")
+assertTrue(poolSourceLog ~= nil, "奖池来源会写进日志（" .. tostring(poolSourceLog) .. "）")
+assertTrue(poolSourceLog ~= nil and poolSourceLog:find("回退出厂默认", 1, true) ~= nil,
+    "回退路径的日志说明了原因（表里没有本区数据）")
+
+if type(rewardPools) == "table" then
+    assertEq(#rewardPools, 6, "出厂默认奖池 6 个（REWARD_POOL_DEFAULTS）")
+    local defaultPoolNames = {}
+    for _, pool in ipairs(rewardPools) do defaultPoolNames[#defaultPoolNames + 1] = tostring(pool.name) end
+    assertTrue(table.concat(defaultPoolNames, ","):find("全员奖", 1, true) ~= nil
+        and table.concat(defaultPoolNames, ","):find("坐骑奖池", 1, true) ~= nil,
+        "出厂默认池名齐全（" .. table.concat(defaultPoolNames, ",") .. "）")
+end
+
+-- `.boss pools`：来源 + 位号契约 + 每池一行
+local poolsText = table.concat(runConsoleCommand("boss pools"), " | ")
+assertTrue(poolsText:find("来源: code", 1, true) ~= nil, ".boss pools 报告来源 code（面板可据此提示迁移）")
+assertTrue(poolsText:find("全员奖", 1, true) ~= nil, ".boss pools 列出生效池（含池名）")
+assertTrue(poolsText:find("位号 = 贡献位图第 (位号-1) 位", 1, true) ~= nil,
+    ".boss pools 说明位号 → 位图的契约（pool_id = k ↔ 第 k-1 位）")
+
+-- 位号 → 位图掩码：2^(pool_id-1)，不是写死的 1..6 位
+local getRewardPoolMask = rawget(env, "GetRewardPoolMask")
+assertTrue(type(getRewardPoolMask) == "function", "取到 GetRewardPoolMask（位号 → 位图掩码）")
+if type(getRewardPoolMask) == "function" then
+    assertEq(getRewardPoolMask(1), 1, "pool_id=1 → 2^0 = 1")
+    assertEq(getRewardPoolMask(6), 32, "pool_id=6 → 2^5 = 32（旧设计的最后一个池）")
+    assertEq(getRewardPoolMask(7), 64, "pool_id=7 → 2^6 = 64（证明位映射不是写死的 1..6）")
+    assertEq(getRewardPoolMask(31), 2 ^ 30, "pool_id=31 → 2^30（高位仍按 pool_id-1 映射）")
+    assertEq(getRewardPoolMask(0), 0, "pool_id=0 非法 → 掩码 0（不置位）")
+    assertEq(getRewardPoolMask(999), 0, "pool_id 超上限 → 掩码 0（不置位）")
+
+    local maxPools = bossLocal("BOSS_MAX_REWARD_POOLS")
+    assertTrue(tonumber(maxPools) ~= nil, "取到文件内 local BOSS_MAX_REWARD_POOLS（位图上限）")
+    if tonumber(maxPools) ~= nil then
+        assertEq(getRewardPoolMask(maxPools), 2 ^ (maxPools - 1),
+            "最大位号的掩码 = 2^(BOSS_MAX_REWARD_POOLS-1)")
+        io.write(string.format(
+            "  [info] BOSS_MAX_REWARD_POOLS = %s；pool_id=32 的掩码 = %s（位图列是有符号 INT，第 32 位会溢出成负数）\n",
+            tostring(maxPools), tostring(getRewardPoolMask(32))))
+    end
+end
+
 -- ------------------------------------------------- 奖池实发（离线驱动：假 Boss + 假玩家）
--- 线上没有玩家时没法验证「真发奖 + 按职业过滤」，这里用假对象把 OnBossDied 整条链路跑一遍：
---   · 6 个奖池改成确定值（全 100% 命中；池 4/5 关闭；池 3 只放"战士专属 + 谁都不可用"）
+-- 线上没有玩家时没法验证「真发奖 + 按职业过滤 + 金币 + 离线邮件」，这里用假对象把 OnBossDied 整条链路跑一遍：
+--   · boss_reward_pools 的桩结果集故意乱序给出 7 个合法池（含 pool_id 7 / 31，就是**不落在 1..6** 的位号）
+--     + 3 个非法池（pool_id 0 / 33 / 与 7 重复）→ 校验排序、丢弃告警与 2^(pool_id-1) 位图
 --   · 职业奖励池映射改成 1=1001（战士专属）/ 8=1002（法师专属）
---   · 两名假玩家（战士 / 法师）各记一笔伤害进贡献池，然后触发死亡结算
+--   · 两名在线假玩家（战士 / 法师）各记一笔伤害进贡献池，然后触发死亡结算
 -- 关键点：boss.lua 的 IsUnitValid 要求 type(unit)=="userdata"，所以本段临时改写 env.type()，
 -- 并让 PerformIngameSpawn 返回假 Boss；段末恢复原样，避免影响后面的多区绑定断言。
 io.write("\n== 奖池实发（离线驱动）==\n")
 
-local rewardCase = {
-    -- 池 1：100% / 全部有效参战 / 战士专属 1001 + 法师专属 1002（classFilter 开）
-    { enabled = 1, chance = 100, mode = "all",   count = 9, classFilter = 1, items = "1001,1002" },
-    -- 池 2：100% / 指定 1 人 / 通用物品 2001（不在职业映射里 → 由核心 CanUseItem 判定）
-    { enabled = 1, chance = 100, mode = "count", count = 1, classFilter = 1, items = "2001" },
-    -- 池 3：100% / 指定 2 人 / 战士专属 1001 + 核心说"谁都不可用"的 9999
-    { enabled = 1, chance = 100, mode = "count", count = 2, classFilter = 1, items = "1001,9999" },
-    -- 池 4 / 5：关闭（不该发任何东西）
-    { enabled = 0, chance = 100, mode = "all",   count = 5, classFilter = 1, items = "4001" },
-    { enabled = 0, chance = 100, mode = "count", count = 5, classFilter = 1, items = "5001" },
-    -- 池 6：100% / 指定 1 人 / 通用物品 6001（验证第 6 个池独立生效）
-    { enabled = 1, chance = 100, mode = "count", count = 1, classFilter = 1, items = "6001" },
-}
-for index, case in ipairs(rewardCase) do
-    EXT_VALUES["reward_pool_" .. index .. "_enabled"] = case.enabled
-    EXT_VALUES["reward_pool_" .. index .. "_chance"] = case.chance
-    EXT_VALUES["reward_pool_" .. index .. "_winner_mode"] = case.mode
-    EXT_VALUES["reward_pool_" .. index .. "_winner_count"] = case.count
-    EXT_VALUES["reward_pool_" .. index .. "_class_filter"] = case.classFilter
-    EXT_VALUES["reward_pool_" .. index .. "_items_text"] = case.items
-end
+-- pool_id = 位号；sort_order 故意与 pool_id 顺序不同，用来证明展示/发奖顺序按 sort_order
+local REWARD_POOL_IDS_IN_ORDER = { 2, 3, 1, 7, 4, 5, 31, 8 }
+recorded.rewardPoolRows = rewardPoolRows({
+    { pool_id = 31, sort_order = 70, name = "高位池", enabled = 1, chance = 100, winner_mode = "count",
+      winner_count = 1, class_filter = 0, items_text = "6001", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+    { pool_id = 1, sort_order = 30, name = "全体池", enabled = 1, chance = 100, winner_mode = "all",
+      winner_count = 9, class_filter = 1, items_text = "1001,1002", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+    { pool_id = 33, sort_order = 5, name = "越界池", enabled = 1, chance = 100, winner_mode = "all",
+      winner_count = 1, class_filter = 0, items_text = "7001", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+    { pool_id = 2, sort_order = 10, name = "单人池", enabled = 1, chance = 100, winner_mode = "count",
+      winner_count = 1, class_filter = 1, items_text = "2001", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+    { pool_id = 3, sort_order = 20, name = "战士池", enabled = 1, chance = 100, winner_mode = "count",
+      winner_count = 2, class_filter = 1, items_text = "1001,9999", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+    { pool_id = 4, sort_order = 50, name = "关闭池A", enabled = 0, chance = 100, winner_mode = "all",
+      winner_count = 5, class_filter = 1, items_text = "4001", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+    { pool_id = 5, sort_order = 60, name = "关闭池B", enabled = 0, chance = 100, winner_mode = "count",
+      winner_count = 5, class_filter = 1, items_text = "5001", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+    -- 金币池：没有物品、只有金币区间（离线补发与在线发放都要走金币通道）
+    { pool_id = 7, sort_order = 40, name = "金币池", enabled = 1, chance = 100, winner_mode = "all",
+      winner_count = 1, class_filter = 0, items_text = "", gold_min_copper = 5000, gold_max_copper = 5000, announce = 0 },
+    -- 空池（无物品 + 金币 0/0）：必须"跳过"而不是报错，也不置位
+    { pool_id = 8, sort_order = 80, name = "空池", enabled = 1, chance = 100, winner_mode = "all",
+      winner_count = 1, class_filter = 0, items_text = "", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+    { pool_id = 0, sort_order = 1, name = "零号池", enabled = 1, chance = 100, winner_mode = "all",
+      winner_count = 1, class_filter = 0, items_text = "8001", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+    { pool_id = 7, sort_order = 41, name = "重复位号池", enabled = 1, chance = 100, winner_mode = "all",
+      winner_count = 1, class_filter = 0, items_text = "9001", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+})
 EXT_VALUES.class_reward_items_text = "1=1001\n8=1002"
-runConsoleCommand("boss config reload")
+local poolsReloadMarkers = markersOf(runConsoleCommand("boss config reload"))
+assertTrue(poolsReloadMarkers:find("AGMP_OK", 1, true) ~= nil,
+    "写入 boss_reward_pools 结果集后 boss config reload 返回 AGMP_OK")
+
+-- 来源与顺序：以表为准（db），按 sort_order 排（pool_id 只做同序时的次级键）
+assertEq(rewardPoolsSource(), "db", "读到 boss_reward_pools 行后来源标记为 db（不再回退出厂默认）")
+local livePools = bossLocal("REWARD_POOLS")
+assertTrue(type(livePools) == "table", "取到运行期 REWARD_POOLS（表驱动后的那份）")
+if type(livePools) == "table" then
+    local orderedIds = {}
+    for _, pool in ipairs(livePools) do orderedIds[#orderedIds + 1] = tostring(pool.poolId) end
+    assertEq(table.concat(orderedIds, ","), table.concat(REWARD_POOL_IDS_IN_ORDER, ","),
+        "奖池按 sort_order 排序（与 pool_id 顺序不同：2→3→1→7→4→5→31→8）")
+    assertEq(#livePools, #REWARD_POOL_IDS_IN_ORDER,
+        "非法奖池全部被丢弃（pool_id 0 / 33 / 与 7 重复，共 3 个）")
+    assertEq(livePools[4] and livePools[4].poolId, 7, "sort_order=40 的池就是 pool_id=7（排序生效）")
+    local pool7 = livePools[4]
+    assertTrue(pool7 ~= nil and pool7.poolId == 7 and pool7.name == "金币池" and pool7.announce == false,
+        "pool_id=7 的池字段来自表（名/公告位解析正确）")
+end
+
+local droppedLog = findLogLine("[奖池]丢弃")
+assertTrue(droppedLog ~= nil, "非法奖池会打告警日志（" .. tostring(droppedLog) .. "）")
+assertTrue(droppedLog ~= nil and droppedLog:find("0", 1, true) ~= nil
+    and droppedLog:find("33", 1, true) ~= nil and droppedLog:find("7", 1, true) ~= nil,
+    "丢弃告警点名了 pool_id 0 / 33 / 重复的 7")
+
+-- `.boss pools` 展示的是表里的行（来源 db + 池名 + 位号）
+local dbPoolsText = table.concat(runConsoleCommand("boss pools"), " | ")
+assertTrue(dbPoolsText:find("来源: db", 1, true) ~= nil, ".boss pools 报告来源 db")
+assertTrue(dbPoolsText:find("金币池", 1, true) ~= nil and dbPoolsText:find("高位池", 1, true) ~= nil,
+    ".boss pools 显示数据库里的池名（含 pool_id 7 / 31 这两个非 1..6 的池）")
+assertTrue(dbPoolsText:find("#31", 1, true) ~= nil and dbPoolsText:find("#7", 1, true) ~= nil,
+    ".boss pools 逐池打印位号（#7 / #31）")
+assertTrue(dbPoolsText:find("越界池", 1, true) == nil, ".boss pools 不再展示被丢弃的越界池")
+
 
 local fakePlayers = {}
-local function newFakePlayer(guidLow, playerName, classId, usableItems)
+local function newFakePlayer(guidLow, playerName, classId, usableItems, startCoinage)
     local player = {
         __fake = true,
         guidLow = guidLow,
@@ -1537,6 +1950,9 @@ local function newFakePlayer(guidLow, playerName, classId, usableItems)
         classId = classId,
         given = {},
         messages = {},
+        -- 金币：ModifyMoney 在 mod-ale 里不返回成功标志，脚本按 GetCoinage 前后差判定
+        coinage = tonumber(startCoinage) or 100000,
+        goldOps = {},
     }
     player.IsInWorld = function() return true end
     player.IsPlayer = function() return true end
@@ -1555,6 +1971,11 @@ local function newFakePlayer(guidLow, playerName, classId, usableItems)
     player.AddItem = function(_, entry, count)
         table.insert(player.given, {entry = entry, count = count or 1})
         return {entry = entry}
+    end
+    player.GetCoinage = function() return player.coinage end
+    player.ModifyMoney = function(_, amount)
+        player.goldOps[#player.goldOps + 1] = amount
+        player.coinage = player.coinage + amount
     end
     player.SendBroadcastMessage = function(_, message) table.insert(player.messages, message) end
     player.GetPlayersInRange = function() return {} end
@@ -1620,7 +2041,10 @@ local function containsId(player, wanted)
 end
 
 -- 生成假 Boss → 记入两名玩家的伤害 → 触发死亡结算
+-- 时钟调到时间段内（20:00-22:00），否则收尾阶段的重生排程会走"推迟到下一个时间段"分支
+setNow(os.time{year = 2026, month = 9, day = 1, hour = 21, min = 0, sec = 0})
 runConsoleCommand("boss spawn force")
+local killBoundary = #recorded.sql
 local damageHandler = engineCallbacks.creature["190090/9"]
 if damageHandler then
     damageHandler(0, fakeBoss, warrior, 5000)
@@ -1654,54 +2078,179 @@ assertTrue(not containsId(warrior, 9999) and not containsId(mage, 9999),
     "核心判定为不可用的物品 9999 没有发给任何人")
 assertTrue(not containsId(warrior, 4001) and not containsId(mage, 4001)
     and not containsId(warrior, 5001) and not containsId(mage, 5001),
-    "已关闭的奖池 4/5 一件都没发")
+    "已关闭的奖池（pool_id 4/5）一件都没发")
+assertTrue(not containsId(warrior, 7001) and not containsId(mage, 7001),
+    "越界（pool_id=33）的池被丢弃，一件都没发")
 assertTrue(containsId(warrior, 6001) or containsId(mage, 6001),
-    "池 6 独立生效（指定 1 人拿到 6001）")
+    "pool_id=31 的池独立生效（指定 1 人拿到 6001）")
 assertTrue(containsId(warrior, 2001) or containsId(mage, 2001),
-    "池 2 的指定 1 人抽奖发给了其中一位玩家")
+    "pool_id=2 的指定 1 人抽奖发给了其中一位玩家")
 assertTrue(#warriorIds >= 2 and #mageIds >= 1,
-    "池 1（全部有效参战）+ 池 3（战士专属）按人数模式发放")
+    "pool_id=1（全部有效参战）+ pool_id=3（战士专属）按人数模式发放")
 
--- 奖池位图（贡献快照）：池 1=bit1、池 2=bit2、池 3=bit4、池 4=bit8、池 5=bit16、池 6=bit32
-local contributorMasks = {}
-for _, item in ipairs(recorded.sql) do
-    if item.sql:find("boss_activity_contributors", 1, true) and item.sql:find("INSERT", 1, true) then
-        local name = item.sql:match("'(测试[^']*)'")
-        local numbers = {}
-        for token in item.sql:gmatch("(%d+)") do numbers[#numbers + 1] = tonumber(token) end
-        if name and #numbers >= 2 and contributorMasks[name] == nil then
-            contributorMasks[name] = numbers[#numbers - 1]   -- 倒数第二个数字 = reward_pools_mask
+-- 金币：pool_id=7 只有金币区间（5000/5000），其余池是 0/0 —— 只有前者该动钱
+assertEq(warrior.coinage - 100000, 5000, "金币池给战士加了 5000 铜（按 GetCoinage 前后差证明真到账）")
+assertEq(mage.coinage - 100000, 5000, "金币池给法师加了 5000 铜")
+assertEq(#warrior.goldOps, 1, "其余奖池是 0/0：既不扣也不加钱（ModifyMoney 只被调用 1 次）")
+assertEq(warrior.goldOps[1], 5000, "ModifyMoney 收到的是池内金额（5000 铜）")
+assertTrue(table.concat(warrior.messages, " "):find("1 银 0 铜", 1, true) ~= nil
+    or table.concat(warrior.messages, " "):find("0 金 0 银 0 铜", 1, true) ~= nil
+    or table.concat(warrior.messages, " "):find("你参与了", 1, true) ~= nil,
+    "获奖者收到含金币金额的中奖提示")
+
+local emptyPoolLog = findLogLine("既没有奖品也没有金币")
+assertTrue(emptyPoolLog ~= nil,
+    "空池（无物品 + 金币 0/0）被跳过并写日志，不影响其它池（" .. tostring(emptyPoolLog) .. "）")
+
+-- 贡献快照的奖池位图：必须用 2^(pool_id-1)，含 pool_id 7 / 31 这两个**不在 1..6** 的位号
+local function snapshotValue(playerName, column)
+    for index = killBoundary + 1, #recorded.sql do
+        local sql = recorded.sql[index].sql
+        if sql:find("INSERT INTO", 1, true) and sql:find("`boss_activity_contributors`", 1, true)
+            and sql:find("'" .. playerName .. "'", 1, true) then
+            local value = insertColumnValue(sql, column)
+            if value ~= nil then return tonumber(value) end
         end
     end
+    return nil
 end
 
-local warriorMask = contributorMasks["测试战士"]
-local mageMask = contributorMasks["测试法师"]
-print(string.format("  [测试] 位图: 战士=%s 法师=%s",
-    tostring(warriorMask), tostring(mageMask)))
+local warriorMask = snapshotValue("测试战士", "reward_pools_mask")
+local mageMask = snapshotValue("测试法师", "reward_pools_mask")
+print(string.format("  [测试] 位图: 战士=%s 法师=%s", tostring(warriorMask), tostring(mageMask)))
 
-if warriorMask and mageMask then
-    assertTrue(warriorMask % 2 >= 1, "位图：战士中过池 1（bit1）")
-    assertTrue(math.floor(warriorMask / 4) % 2 == 1, "位图：战士中过池 3（bit4，战士专属物品）")
-    assertTrue(mageMask % 2 >= 1, "位图：法师中过池 1（bit1）")
-    assertTrue(math.floor(mageMask / 4) % 2 == 0,
-        "位图：法师没有中池 3（池内只有战士专属 + 不可用物品 → 不发）")
-    assertTrue(math.floor(warriorMask / 8) % 2 == 0 and math.floor(mageMask / 8) % 2 == 0,
-        "位图：奖池 4 关闭 → bit8 未置位")
-    assertTrue(math.floor(warriorMask / 16) % 2 == 0 and math.floor(mageMask / 16) % 2 == 0,
-        "位图：奖池 5 关闭 → bit16 未置位")
-else
-    fail("没抓到贡献快照的奖池位图（reward_pools_mask）")
+assertTrue(warriorMask ~= nil and mageMask ~= nil, "贡献快照写入了 reward_pools_mask（两位玩家都抓到）")
+
+if warriorMask ~= nil and mageMask ~= nil and type(getRewardPoolMask) == "function" then
+    local function maskHasBit(mask, poolId)
+        local bitValue = getRewardPoolMask(poolId)
+        if bitValue <= 0 then return false end
+        return math.floor((mask or 0) / bitValue) % 2 == 1
+    end
+
+    assertTrue(maskHasBit(warriorMask, 1) and maskHasBit(mageMask, 1),
+        "位图：两位都中过 pool_id=1（bit 2^0）")
+    assertTrue(maskHasBit(warriorMask, 3) and not maskHasBit(mageMask, 3),
+        "位图：只有战士中过 pool_id=3（池内只有战士专属 + 核心判定不可用物品）")
+    assertTrue(maskHasBit(warriorMask, 7) and maskHasBit(mageMask, 7),
+        "位图：pool_id=7 → bit 2^6（金币池对全体发放，证明位映射不是写死的 1..6）")
+    assertTrue(maskHasBit(warriorMask, 31) ~= maskHasBit(mageMask, 31),
+        "位图：pool_id=31 → bit 2^30 只落在 1 个人身上（高位位号同样按 pool_id-1 映射）")
+    assertTrue(not maskHasBit(warriorMask, 4) and not maskHasBit(mageMask, 4),
+        "位图：pool_id=4 已关闭 → bit 2^3 未置位")
+    assertTrue(not maskHasBit(warriorMask, 5) and not maskHasBit(mageMask, 5),
+        "位图：pool_id=5 已关闭 → bit 2^4 未置位")
+    assertTrue(not maskHasBit(warriorMask, 8) and not maskHasBit(mageMask, 8),
+        "位图：pool_id=8 是空池 → bit 2^7 未置位")
 end
 
 assertTrue(#warrior.messages > 0 and #mage.messages > 0, "获奖者收到了中奖提示")
 assertTrue(#recorded.replies > 0 and table.concat(recorded.replies, " "):find("获奖名单", 1, true) ~= nil,
     "击杀后广播了按奖池分组的获奖名单")
+assertTrue(table.concat(recorded.replies, " "):find("金币池", 1, true) == nil,
+    "announce=0 的池不进世界通告（金币池公告位解析正确）")
+
+-- --------------------------------------------- 结算后的收尾（快照 / reward_granted / 重生排程）
+local sawRewardGranted, sawSnapshot, sawRespawnScheduled, respawnDelay = false, false, false, nil
+for index = killBoundary + 1, #recorded.sql do
+    local sql = recorded.sql[index].sql
+    if sql:find("'reward_granted'", 1, true) then sawRewardGranted = true end
+    if sql:find("'respawn_scheduled'", 1, true) then sawRespawnScheduled = true end
+    if sql:find("`boss_activity_contributors`", 1, true) and sql:find("INSERT", 1, true) then sawSnapshot = true end
+end
+-- 重生排程走 CreateLuaEvent（respawn_time_minutes=10 → 600000ms）
+for index = #scheduledEvents, 1, -1 do
+    local scheduled = scheduledEvents[index]
+    if scheduled.delay and scheduled.delay == 600000 then respawnDelay = scheduled.delay end
+end
+assertTrue(sawRewardGranted, "结算写入 event_type='reward_granted'")
+assertTrue(sawSnapshot, "结算写入贡献快照（boss_activity_contributors）")
+assertTrue(sawRespawnScheduled, "结算写入 event_type='respawn_scheduled'")
+assertEq(respawnDelay, 600000, "结算后按 respawn_time_minutes 排出重生计时（CreateLuaEvent 600000ms）")
+
+local snapshotClassId = snapshotValue("测试战士", "class_id")
+io.write(string.format("  [info] 贡献快照 class_id = %s（列在 DDL / 列契约自检里，但 INSERT 列清单里没有它）\n",
+    tostring(snapshotClassId)))
+
+
+-- ------------------------------------------------- 离线补发（邮件通道）
+-- 击杀时已下线的贡献者**不再被丢掉**：改走 SendMail 按 GUID 投递，物品与金币都能寄。
+-- 职业过滤用贡献记录里落下的 classId（采样时玩家还在线）。
+io.write("\n== 离线补发（邮件）==\n")
+
+recorded.rewardPoolRows = rewardPoolRows({
+    { pool_id = 9, sort_order = 10, name = "离线池", enabled = 1, chance = 100, winner_mode = "all",
+      winner_count = 1, class_filter = 0, items_text = "3001", gold_min_copper = 700, gold_max_copper = 700, announce = 1 },
+})
+runConsoleCommand("boss config reload")
+assertEq(rewardPoolsSource(), "db", "离线补发段：奖池同样来自 boss_reward_pools 表")
+assertEq(EXT_VALUES.offline_reward_delivery, 1, "离线补发段：offline_reward_delivery = 1")
+
+local goblin = newFakePlayer(503, "测试盗贼", 4, {[3001] = true})
+runConsoleCommand("boss spawn force")
+damageHandler(0, fakeBoss, warrior, 100)
+damageHandler(0, fakeBoss, mage, 100)
+damageHandler(0, fakeBoss, goblin, 100)
+-- 打完就下线：GetPlayerByGUID 查不到 → 结算时 entry.player = nil → 走邮件
+fakePlayers[503] = nil
+
+local mailBoundary, mailsBefore = #recorded.sql, #recorded.mails
+deathHandler(0, fakeBoss, warrior)
+
+local mailed = recorded.mails[#recorded.mails]
+assertEq(#recorded.mails, mailsBefore + 1, "离线贡献者收到 1 封补发邮件（不再被静默丢弃）")
+if mailed ~= nil and #recorded.mails > mailsBefore then
+    assertEq(mailed.receiverGUIDLow, 503, "邮件收件人是离线玩家的 GUID low（player_guid）")
+    assertEq(mailed.senderGUIDLow, 0, "邮件发件人是系统（senderGUIDLow = 0）")
+    assertEq(mailed.stationery, 61, "邮件用 MAIL_STATIONERY_DEFAULT(61)")
+    assertEq(tonumber(mailed.itemId), 3001, "邮件寄出池内物品 3001")
+    assertEq(tonumber(mailed.money), 700, "邮件附上池内金币 700 铜")
+    assertTrue(tostring(mailed.subject):find("战利品", 1, true) ~= nil,
+        "邮件主题带战利品字样（" .. tostring(mailed.subject) .. "）")
+end
+assertTrue(findLogLine("已按离线补发寄出") ~= nil, "离线补发会写日志（便于 GM 核对）")
+
+-- 在线的两位照旧进背包 + 金币，说明离线路径没有影响在线路径
+assertEq(warrior.coinage - 100000, 5000 + 700, "在线战士的金币 = 金币池 5000 + 离线段的离线池 700")
+assertTrue(containsId(warrior, 3001) and containsId(mage, 3001),
+    "在线玩家照常从离线池拿到物品（离线路径不影响在线路径）")
+
+-- offline_reward_delivery = 0：离线者不发（也不寄邮件），在线者照常
+EXT_VALUES.offline_reward_delivery = 0
+runConsoleCommand("boss config reload")
+local suppressed = newFakePlayer(504, "测试术士", 9, {[3001] = true})
+-- 时钟挪到时间段外：顺带断言"结算后的重生排程在时段外会推迟"
+setNow(os.time{year = 2026, month = 9, day = 1, hour = 23, min = 0, sec = 0})
+runConsoleCommand("boss spawn force")
+damageHandler(0, fakeBoss, warrior, 100)
+damageHandler(0, fakeBoss, mage, 100)
+damageHandler(0, fakeBoss, suppressed, 100)
+fakePlayers[504] = nil
+
+local suppressBoundary, mailsBeforeSuppress = #recorded.sql, #recorded.mails
+deathHandler(0, fakeBoss, warrior)
+
+assertEq(#recorded.mails, mailsBeforeSuppress, "offline_reward_delivery=0 时不发补发邮件")
+assertTrue(findLogLine("未开启离线补发") ~= nil, "跳过时写明原因是未开启离线补发")
+
+local sawDeferred = false
+for index = suppressBoundary + 1, #recorded.sql do
+    if recorded.sql[index].sql:find("'respawn_deferred'", 1, true) then sawDeferred = true end
+end
+assertTrue(sawDeferred, "时段外结算不排重生计时，改写 respawn_deferred（进入下一个时间段后自动生成）")
+
+-- 恢复 ext 快照里的离线补发开关，避免影响后面的段落
+EXT_VALUES.offline_reward_delivery = 1
+runConsoleCommand("boss config reload")
+assertTrue(mailBoundary > 0, "离线补发段的 SQL 边界有效（扫描范围不为空）")
 
 -- 恢复场地：桩函数与假对象都要撤掉，后面的多区绑定断言仍用原来的桩
 env.type = originalType
 env.PerformIngameSpawn = originalPerformIngameSpawn
 env.GetPlayerByGUID = originalGetPlayerByGUID
+recorded.rewardPoolRows = nil
+runConsoleCommand("boss config reload")
+assertEq(rewardPoolsSource(), "code", "清空奖池结果集后来源又回到 code（回落分支可重复进入）")
 
 -- ------------------------------------------------- 连招施放（离线驱动：假 Boss + 假玩家）
 -- 奖池实发段只证明「死亡结算」这条链路；这里补的是**连招真的会被执行**：
@@ -1994,6 +2543,7 @@ io.write("\n== 多区绑定（共用库 + state_key 分租） ==\n")
 
 local function isDbQualified(sql)
     return sql:find("`boss_activity", 1, true) ~= nil
+        or sql:find("`boss_reward_pools`", 1, true) ~= nil
         or sql:find("CREATE DATABASE", 1, true) ~= nil
 end
 
@@ -2105,6 +2655,16 @@ for _, item in ipairs(childSql) do
     end
 end
 assertTrue(keySeen, "runtime 语句使用本区 state_key（" .. targetRuntimeKey .. "）")
+
+-- 奖池查询同样按改写后的 key 走（不是写死的 'current'）
+local poolKeySeen = false
+for _, item in ipairs(childSql) do
+    if item.sql:find("`boss_reward_pools`", 1, true) and item.sql:find("SELECT", 1, true)
+        and item.sql:find("`state_key` = '" .. targetRuntimeKey .. "'", 1, true) then
+        poolKeySeen = true
+    end
+end
+assertTrue(poolKeySeen, "奖池查询使用本区 state_key（" .. targetRuntimeKey .. "）")
 
 -- --------------------------------------------------------------------- 汇总
 -- 可选：把本次运行生成的所有 SQL 落盘，便于人工复核语句是否符合预期。

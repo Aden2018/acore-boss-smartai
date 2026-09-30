@@ -6,8 +6,10 @@
 #
 #    1. 从仓库取 boss.lua，改写 §2 的本区 key → 写入 <RealmRoot>\lua_scripts\boss.lua
 #       （-DbName 只在给某个区单独一个库时才需要；默认 ac_eluna）
-#    2. 写入前自动备份（boss.lua.<时间戳>.bak）
-#    3. 可选：语法检查（-LuaExe）与导入难度档位 SQL（-ApplyTierSql <world 库>）；
+#    2. 写入前自动备份（boss.lua.<时间戳>.bak），写完打印源/目标 SHA256
+#    3. 可选：语法检查（-LuaExe）、**对部署件跑离线冒烟**（-SmokeScript，消除"测试件≠部署件"）、
+#       导入难度档位 SQL（-ApplyTierSql <world 库>）、导入配置类 SQL
+#       （-ApplyConfigSql <配置库>：奖池 v2 + 跨重启恢复列，带命中数断言）；
 #       导入前会把 SQL 里写死的库名**与本区 key** 一起改写，避免动到别的区
 #    4. 打印 AGMP 面板 config/boss.php 需要同步的 server_overrides 片段
 #
@@ -16,9 +18,10 @@
 #    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-a>
 #    # 第二个区：必须给它自己的 key（不能是 current，否则与主区共用一份数据）
 #    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b>
-#    # 连难度档位模板一起导进该区的 world 库
+#    # 部署 + 语法检查 + 部署件冒烟 + 配置 SQL + 难度档位模板
 #    pwsh -File tools\deploy-realm.ps1 -RealmRoot D:\AzerothCore\release\<realm-b> -RuntimeKey <realm-b> `
-#        -ApplyTierSql <该区 world 库>
+#        -LuaExe <lua.exe> -SmokeScript tools\boss-lua-smoke\smoke.lua `
+#        -ApplyConfigSql <配置库> -ApplyTierSql <该区 world 库> -DbPassword <密码>
 #
 #  部署完：让该区 worldserver 重新加载 Eluna（.reload ale 或重启），并把面板
 #          config/generated/boss.php 的 server_overrides 加上该区（脚本会打印片段）。
@@ -40,8 +43,16 @@ param(
     # 可选：Lua 解释器路径，给了就对新文件做一次语法检查
     [string]$LuaExe = '',
 
+    # 可选：冒烟测试脚本路径（tools\boss-lua-smoke\smoke.lua）；给了就对**部署后的文件**跑一次，
+    # 确保"测试件 = 部署件"（需要 -LuaExe）
+    [string]$SmokeScript = '',
+
     # 可选：把难度档位 SQL 导入这个 world 库（如 <该区 world 库>）
     [string]$ApplyTierSql = '',
+
+    # 可选：把配置类 SQL（奖池 v2 + 跨重启恢复列）导入这个配置库（如 ac_eluna），
+    # 导入后按行数断言，避免"脚本跑了但一行没进去"
+    [string]$ApplyConfigSql = '',
 
     # 可选：MySQL 客户端与连接参数（仅在 -ApplyTierSql 时需要）
     [string]$MysqlExe = 'C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe',
@@ -65,6 +76,36 @@ if ($Source -eq '') {
 
 function Write-Step([string]$text) { Write-Host "== $text" }
 function Write-Detail([string]$text) { Write-Host "   $text" }
+
+# 导入一个 SQL 文件到指定库。密码走临时 defaults-extra-file（不落在命令行/进程列表里）。
+function Invoke-BossSqlFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$SqlPath,
+        [Parameter(Mandatory = $true)][string]$Database,
+        [string]$Label = ''
+    )
+
+    if (-not (Test-Path -LiteralPath $MysqlExe -PathType Leaf)) {
+        throw "找不到 mysql.exe: $MysqlExe（可用 -MysqlExe 指定）"
+    }
+    if ($DbPassword -eq '') {
+        throw "导入 SQL 需要 -DbPassword（或用面板/手工导入），避免在命令行里留下空密码提示。"
+    }
+
+    $extra = Join-Path ([System.IO.Path]::GetTempPath()) ('boss-mysql-' + [guid]::NewGuid().ToString('N') + '.cnf')
+    try {
+        [System.IO.File]::WriteAllText($extra, "[client]`nuser=$DbUser`npassword=$DbPassword`n", $utf8NoBom)
+        $mysqlArgs = @("--defaults-extra-file=$extra", "--host=$DbHost", "--port=$DbPort",
+                       '--default-character-set=utf8mb4', $Database)
+        $output = Get-Content -LiteralPath $SqlPath -Raw | & $MysqlExe @mysqlArgs 2>&1
+        $exit = $LASTEXITCODE
+        $output | Where-Object { $_ -notmatch 'Using a password' } | ForEach-Object { Write-Detail ([string]$_) }
+        if ($exit -ne 0) { throw "$Label 导入失败（mysql 退出码 $exit）：$SqlPath" }
+        return $output
+    } finally {
+        if (Test-Path -LiteralPath $extra) { Remove-Item -LiteralPath $extra -Force }
+    }
+}
 
 # ---------------------------------------------------------------------- 校验
 if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
@@ -169,7 +210,28 @@ if ($DryRun) {
 
     [System.IO.File]::WriteAllText($target, $newText, $utf8NoBom)
     $written = [System.IO.File]::ReadAllBytes($target)
+    $writtenHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+    $sourceHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
     Write-Detail "写入完成: $($written.Length) 字节（全库字形保持一致；Eluna 读该文件无需 BOM）"
+    Write-Detail "目标 SHA256: $writtenHash"
+    Write-Detail "源   SHA256: $sourceHash（与目标不同是正常的：本区 key 被改写）"
+}
+
+# ------------------------------------------------------------------ 部署件冒烟
+# "测试件 ≠ 部署件"是这类部署最容易出的事故：跑过冒烟的是仓库文件，真正上线的是改写过的副本。
+if ($SmokeScript -ne '') {
+    Write-Step '对部署后的文件跑离线冒烟'
+    if ($LuaExe -eq '') { throw 'SmokeScript 需要同时给 -LuaExe' }
+    if (-not (Test-Path -LiteralPath $SmokeScript -PathType Leaf)) { throw "找不到冒烟脚本: $SmokeScript" }
+    if ($DryRun) {
+        Write-Detail "DryRun：将执行 $LuaExe $SmokeScript $target"
+    } else {
+        $smokeOut = & $LuaExe $SmokeScript $target 2>&1
+        $smokeCode = $LASTEXITCODE
+        $smokeOut | Where-Object { $_ -match 'FAIL|RESULT|汇总|记录 SQL' } | ForEach-Object { Write-Detail ([string]$_) }
+        if ($smokeCode -ne 0) { throw "部署件冒烟未通过（退出码 $smokeCode）：$target" }
+        Write-Detail "部署件冒烟通过（退出码 0）"
+    }
 }
 
 # --------------------------------------------------------------- 难度档位 SQL
@@ -194,26 +256,68 @@ if ($ApplyTierSql -ne '') {
     if ($DryRun) {
         Write-Detail "DryRun：将执行 mysql < 改写后的 SQL（库 $ApplyTierSql）"
     } else {
-        if (-not (Test-Path -LiteralPath $MysqlExe -PathType Leaf)) {
-            throw "找不到 mysql.exe: $MysqlExe（可用 -MysqlExe 指定）"
-        }
-        if ($DbPassword -eq '') {
-            throw '导入 SQL 需要 -DbPassword（或用面板/手工导入），避免在命令行里留下空密码提示。'
-        }
-
         $tmpSql = Join-Path ([System.IO.Path]::GetTempPath()) ('boss-realm-tiers-' + [guid]::NewGuid().ToString('N') + '.sql')
         try {
             [System.IO.File]::WriteAllText($tmpSql, $tierForRealm, $utf8NoBom)
-            $mysqlArgs = @("--host=$DbHost", "--port=$DbPort", "--user=$DbUser", "--password=$DbPassword",
-                           '--default-character-set=utf8mb4', $ApplyTierSql)
-            Get-Content -LiteralPath $tmpSql -Raw | & $MysqlExe @mysqlArgs 2>&1 |
-                ForEach-Object { if ($_ -notmatch 'Using a password') { Write-Detail ([string]$_) } }
-            if ($LASTEXITCODE -ne 0) { throw "导入失败（mysql 退出码 $LASTEXITCODE）" }
+            Invoke-BossSqlFile -SqlPath $tmpSql -Database $ApplyTierSql -Label '难度档位 SQL' | Out-Null
         } finally {
             if (Test-Path -LiteralPath $tmpSql) { Remove-Item -LiteralPath $tmpSql -Force }
         }
 
         Write-Detail '导入完成；该区 worldserver 里执行 .reload creature_template 后生效。'
+    }
+}
+
+# --------------------------------------------------------------- 配置类 SQL
+# 奖池 v2（建 boss_reward_pools 并迁移金币）与跨重启恢复的新列。两者都幂等，可重复执行。
+# 顺序固定：先建表迁移，再补列（补列脚本依赖旧主表金币列还在，必须在 boss.lua 加载前跑）。
+if ($ApplyConfigSql -ne '') {
+    $sqlRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'sql'
+    $configSqls = @(
+        '2026_09_30_reward_pools_v2.sql',
+        '2026_09_30_boss_recovery_columns.sql'
+    )
+
+    Write-Step "导入配置类 SQL → $ApplyConfigSql"
+    foreach ($name in $configSqls) {
+        $path = Join-Path $sqlRoot $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "找不到 SQL: $path" }
+        if ($DryRun) {
+            Write-Detail "DryRun：将导入 $name"
+            continue
+        }
+
+        Invoke-BossSqlFile -SqlPath $path -Database $ApplyConfigSql -Label $name | Out-Null
+        Write-Detail "已导入 $name"
+    }
+
+    if (-not $DryRun) {
+        # 命中数断言：脚本跑过不等于数据进去了（缺列/权限不对时 MySQL 会中途报错）
+        # 注意：这里必须用单引号 here-string —— 双引号会把反引号当转义字符，把 `boss_reward_pools` 吃成 oss_reward_pools。
+        $assertSql = @'
+SELECT '奖池行数' AS check_item, COUNT(*) AS found FROM `boss_reward_pools`
+UNION ALL SELECT '有金币的池数（>0 即可）', COUNT(*) FROM `boss_reward_pools` WHERE `gold_max_copper` > 0
+UNION ALL SELECT 'runtime 新列', COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'boss_activity_runtime'
+    AND COLUMN_NAME IN ('health_pct','spawn_point_index','last_health_sample_at')
+UNION ALL SELECT 'ext 新列', COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'boss_activity_config_ext'
+    AND COLUMN_NAME IN ('health_sample_interval_sec','recovery_min_health_pct','boss_recovered_yell','last_hit_only_qualifies','offline_reward_delivery');
+'@
+        $assertFile = Join-Path ([System.IO.Path]::GetTempPath()) ('boss-assert-' + [guid]::NewGuid().ToString('N') + '.sql')
+        try {
+            [System.IO.File]::WriteAllText($assertFile, $assertSql, $utf8NoBom)
+            $rows = Invoke-BossSqlFile -SqlPath $assertFile -Database $ApplyConfigSql -Label '命中数断言'
+            $poolTotal = 0
+            foreach ($line in $rows) {
+                $cells = ([string]$line) -split "`t"
+                if ($cells.Count -ge 2 -and $cells[0] -eq '奖池行数') { $poolTotal = [int]$cells[1] }
+            }
+            if ($poolTotal -le 0) { throw "命中数断言失败：boss_reward_pools 里没有任何行" }
+            Write-Detail "命中数断言通过：奖池 $poolTotal 行"
+        } finally {
+            if (Test-Path -LiteralPath $assertFile) { Remove-Item -LiteralPath $assertFile -Force }
+        }
     }
 }
 

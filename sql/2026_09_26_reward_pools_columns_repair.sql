@@ -1,10 +1,13 @@
 -- ============================================================================
 --  补列脚本：boss_activity_config_ext 的 6 奖池 + 职业过滤映射列
+--  ⚠ 已被 2026_09_30_reward_pools_v2.sql 取代：奖池现在是 `boss_reward_pools` 表（数量任意 +
+--    金币区间 + 软删除 + 位号不复用），扩展表的 reward_pool_N_* 列属上一版模型。
+--    只有在需要复现上一版行为时才执行本文件。
 --  场景：ext 表是旧版本创建的，缺列时报 Unknown column 'reward_pool_1_enabled' in 'field list'
 --  库  ：boss.lua 的配置库（默认 ac_eluna；多区共用同一个库，**只需执行一次**）
 --  幂等：已存在的列自动跳过，可反复执行
 --  用法：mysql -h <host> -P <port> -u <user> -p <库名> < 本文件
---        例：mysql -h 127.0.0.1 -P 43306 -u root -p ac_eluna < 本文件
+--        例：mysql -h <host> -P <port> -u root -p ac_eluna < 本文件
 --  执行后：游戏内 `.boss config reload`（或在 AGMP 面板点一次保存）让脚本重新读取
 -- ============================================================================
 
