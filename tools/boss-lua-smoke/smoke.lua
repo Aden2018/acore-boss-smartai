@@ -55,8 +55,9 @@ local function captureGlobalPrint(run)
     end
 end
 
-local function findLogLine(pattern)
-    for _, line in ipairs(recorded.logLines) do
+local function findLogLine(pattern, fromIndex)
+    for index = fromIndex or 1, #recorded.logLines do
+        local line = recorded.logLines[index]
         if line:find(pattern, 1, true) then return line end
     end
     return nil
@@ -347,6 +348,8 @@ env.CharDBQuery = function(sql)
         if sql:find("`boss_guid`", 1, true) then
             return recorded.runtimeRow and mockResultSet({recorded.runtimeRow}) or nil
         end
+        -- 模拟"语句执行成功但数据没落地"：回读校验拿不到行
+        if recorded.runtimeVerifyFails then return nil end
         return mockQuery({"idle"})
     end
     return nil -- 其它：模拟"没有行"
@@ -964,8 +967,13 @@ for _, case in ipairs(cases) do
 end
 end
 
+local function showGroup(group)
+    return table.concat(runConsoleCommand("boss config show " .. group), " | ")
+end
+
 -- 配置展示 + 「运行时以数据库为准」：ext 表里的值必须真的生效，而不是被默认值盖掉
 io.write("\n== .boss config show ==\n")
+do
 local groupMessages = runConsoleCommand("boss config show")
 local groupText = table.concat(groupMessages, " | ")
 assertTrue(#groupMessages > 0, ".boss config show 有输出")
@@ -1001,10 +1009,6 @@ assertEq(listedGroupCount, #groupKeys, "展示出的有项分组数与预期一�
 if type(extSchema) == "table" and type(mainSchema) == "table" then
     assertEq(listedTotal, #mainSchema + #extSchema,
         string.format("分组项数之和 = 描述表总数（主表 %d + 扩展表 %d）", #mainSchema, #extSchema))
-end
-
-local function showGroup(group)
-    return table.concat(runConsoleCommand("boss config show " .. group), " | ")
 end
 
 local yellsText = showGroup("yells")
@@ -1081,6 +1085,7 @@ assertTrue(badMarkers:find("AGMP_ERROR", 1, true) ~= nil, "未知配置分组返
 
 local badUsage = markersOf(runConsoleCommand("boss config oops"))
 assertTrue(badUsage:find("AGMP_ERROR", 1, true) ~= nil, ".boss config <未知子命令> 返回 AGMP_ERROR")
+end
 
 -- 非 boss 命令必须放行（返回 true 表示交给核心继续处理）
 io.write("\n== 非 boss 命令放行 ==\n")
@@ -1865,6 +1870,19 @@ if type(getRewardPoolMask) == "function" then
     end
 end
 
+-- 诊断（不改结论）：表在、但本区一行都没有（0 行结果集）时的行为。
+-- 读出的是"空结果集"，而 ReadRewardPoolsFromQuery 对非 nil 的 query 总会先读一次首行 → 会产出一个
+-- pool_id=0 的条目，于是 #pools > 0 成立、播种分支（要求 #pools == 0）永远进不去。
+recorded.rewardPoolRows = {}
+runConsoleCommand("boss config reload")
+local zeroRowPools = bossLocal("REWARD_POOLS")
+io.write(string.format(
+    "  [info] boss_reward_pools 返回 0 行时：来源=%s，运行期池数=%s（播种/回落分支都要求 pools 为空，见报告）\n",
+    tostring(rewardPoolsSource()), tostring(type(zeroRowPools) == "table" and #zeroRowPools or -1)))
+recorded.rewardPoolRows = nil
+runConsoleCommand("boss config reload")
+assertEq(rewardPoolsSource(), "code", "清空奖池结果集后来源又回到 code（回落分支可重复进入）")
+
 -- ------------------------------------------------- 奖池实发（离线驱动：假 Boss + 假玩家）
 -- 线上没有玩家时没法验证「真发奖 + 按职业过滤 + 金币 + 离线邮件」，这里用假对象把 OnBossDied 整条链路跑一遍：
 --   · boss_reward_pools 的桩结果集故意乱序给出 7 个合法池（含 pool_id 7 / 31，就是**不落在 1..6** 的位号）
@@ -1904,6 +1922,7 @@ recorded.rewardPoolRows = rewardPoolRows({
       winner_count = 1, class_filter = 0, items_text = "9001", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
 })
 EXT_VALUES.class_reward_items_text = "1=1001\n8=1002"
+local poolsLogBoundary = #recorded.logLines
 local poolsReloadMarkers = markersOf(runConsoleCommand("boss config reload"))
 assertTrue(poolsReloadMarkers:find("AGMP_OK", 1, true) ~= nil,
     "写入 boss_reward_pools 结果集后 boss config reload 返回 AGMP_OK")
@@ -1925,7 +1944,7 @@ if type(livePools) == "table" then
         "pool_id=7 的池字段来自表（名/公告位解析正确）")
 end
 
-local droppedLog = findLogLine("[奖池]丢弃")
+local droppedLog = findLogLine("[奖池]丢弃", poolsLogBoundary)
 assertTrue(droppedLog ~= nil, "非法奖池会打告警日志（" .. tostring(droppedLog) .. "）")
 assertTrue(droppedLog ~= nil and droppedLog:find("0", 1, true) ~= nil
     and droppedLog:find("33", 1, true) ~= nil and droppedLog:find("7", 1, true) ~= nil,
@@ -2531,6 +2550,647 @@ env.GetPlayerByGUID = savedComboGetPlayer
 assertTrue(env.math == savedComboMath and env.type == savedComboType
     and env.PerformIngameSpawn == savedComboSpawn and env.GetPlayerByGUID == savedComboGetPlayer,
     "连招段结束：env.math / env.type / PerformIngameSpawn / GetPlayerByGUID 全部还原")
+
+-- ------------------------------------------------- 结算韧性 / 出厂默认实发 / 口径回归（离线驱动）
+-- 三件事：
+--   1) 结算三段式的卖点：中段（发奖）抛错也必须写快照、写 reward_granted、排重生；
+--   2) 读不到 boss_reward_pools 时出厂默认池照样发奖（活动不因配置表异常停摆）；
+--   3) 一批"改过就该断言"的口径：治疗不要求治疗者本人站位、同 tick 去重、
+--      巡逻脱缰中心用 home_*、打断预筛距离取自打断池、(min,max) 写反要归一。
+io.write("\n== 结算韧性（注入中段异常） ==\n")
+do
+local savedType, savedSpawn, savedGetPlayer = env.type, env.PerformIngameSpawn, env.GetPlayerByGUID
+
+local fakePlayers = {}
+local function newPlayer(guidLow, playerName, classId, instanceId)
+    local player = {
+        __fake = true, guidLow = guidLow, name = playerName, classId = classId,
+        instanceId = tonumber(instanceId) or 0,
+        given = {}, messages = {}, coinage = 100000, goldOps = {},
+    }
+    player.IsInWorld = function() return true end
+    player.IsPlayer = function() return true end
+    player.GetName = function() return playerName end
+    player.GetGUIDLow = function() return guidLow end
+    player.GetGUID = function() return tostring(guidLow) end
+    player.GetClass = function() return classId end
+    player.GetAccountId = function() return 9000 + guidLow end
+    player.GetMapId = function() return 571 end
+    player.GetInstanceId = function() return player.instanceId end
+    player.GetX = function() return 4108.16 end
+    player.GetY = function() return 5316.85 end
+    player.GetZ = function() return 28.76 end
+    player.GetDistance = function() return 5 end
+    player.CanUseItem = function() return true end
+    player.AddItem = function(_, entry, count)
+        table.insert(player.given, {entry = entry, count = count or 1})
+        return {entry = entry}
+    end
+    player.GetCoinage = function() return player.coinage end
+    player.ModifyMoney = function(_, amount)
+        player.goldOps[#player.goldOps + 1] = amount
+        player.coinage = player.coinage + amount
+    end
+    player.SendBroadcastMessage = function(_, message) table.insert(player.messages, message) end
+    player.GetPlayersInRange = function() return {} end
+    fakePlayers[guidLow] = player
+    return player
+end
+
+local function newBoss(guid, instanceId)
+    local boss = {
+        __fake = true, guid = guid, instanceId = tonumber(instanceId) or 0,
+        events = {}, yells = {}, maxHealth = 1000, health = 1000,
+        movedHome = false, movedRandom = 0,
+    }
+    boss.IsInWorld = function() return true end
+    boss.IsAlive = function() return true end
+    boss.IsInCombat = function() return false end
+    boss.GetGUIDLow = function() return guid end
+    boss.GetEntry = function() return 190090 end
+    boss.GetName = function() return "送财童子" end
+    boss.GetMapId = function() return 571 end
+    boss.GetInstanceId = function() return boss.instanceId end
+    boss.GetX = function() return 4108.16 end
+    boss.GetY = function() return 5316.85 end
+    boss.GetZ = function() return 28.76 end
+    boss.GetO = function() return 0 end
+    boss.GetMaxHealth = function() return boss.maxHealth end
+    boss.GetHealth = function() return boss.health end
+    boss.SetMaxHealth = function(_, value) boss.maxHealth = value end
+    boss.SetHealth = function(_, value) boss.health = value end
+    boss.SetLevel = function() end
+    boss.SetScale = function() end
+    boss.SetHomePosition = function() end
+    boss.UpdateEntry = function() end
+    boss.AddAura = function() end
+    boss.RemoveAura = function() end
+    boss.SendUnitYell = function(_, message) table.insert(boss.yells, tostring(message)) end
+    boss.RemoveEvents = function() boss.events = {} end
+    boss.RegisterEvent = function(_, fn, delay, repeats)
+        table.insert(boss.events, {fn = fn, delay = delay, repeats = repeats})
+    end
+    boss.MoveHome = function() boss.movedHome = true end
+    boss.MoveRandom = function(_, radius) boss.movedRandom = boss.movedRandom + 1; boss.movedRadius = radius end
+    boss.GetPlayersInRange = function() return {} end
+    boss.GetThreatList = function() return {} end
+    boss.GetVictim = function() return nil end
+    boss.GetDistance = function() return 5 end
+    return boss
+end
+
+local function hasId(player, wanted)
+    for _, entry in ipairs(player.given) do
+        if entry.entry == wanted then return true end
+    end
+    return false
+end
+
+env.type = function(value)
+    if type(value) == "table" and rawget(value, "__fake") then return "userdata" end
+    return savedType(value)
+end
+
+local activeBoss = nil
+env.PerformIngameSpawn = function()
+    recorded.spawnAttempts = (recorded.spawnAttempts or 0) + 1
+    return activeBoss
+end
+env.GetPlayerByGUID = function(guid)
+    local numeric = tonumber(guid)
+    if numeric and fakePlayers[numeric] then return fakePlayers[numeric] end
+    return fakePlayers[guid]
+end
+
+local damageHandler = engineCallbacks.creature["190090/9"]
+local deathHandler = engineCallbacks.creature["190090/4"]
+
+-- ① 出厂默认池实发（读不到表 → 来源 code）
+recorded.rewardPoolRows = nil
+runConsoleCommand("boss config reload")
+assertEq(rewardPoolsSource(), "code", "读不到 boss_reward_pools 时来源 = code")
+local fallbackPools = bossLocal("REWARD_POOLS")
+assertEq(type(fallbackPools) == "table" and #fallbackPools or 0, 6, "回落后运行期仍持有 6 个出厂默认池")
+
+local defaultWarrior = newPlayer(701, "默认战士", 1, 0)
+local defaultMage = newPlayer(702, "默认法师", 8, 0)
+activeBoss = newBoss(777301, 0)
+setNow(os.time{year = 2026, month = 9, day = 1, hour = 21, min = 0, sec = 0})
+-- 上一段（连招施放）留下的活跃 Boss 还在，先清干净，否则 HasActiveBoss() 会挡住生成
+runConsoleCommand("boss clear")
+local fallbackSpawnMarkers = markersOf(runConsoleCommand("boss spawn force"))
+assertTrue(fallbackSpawnMarkers:find("AGMP_OK", 1, true) ~= nil, "出厂默认段：生成假 Boss 成功")
+damageHandler(0, activeBoss, defaultWarrior, 900)
+damageHandler(0, activeBoss, defaultMage, 100)
+deathHandler(0, activeBoss, defaultWarrior)
+local defaultIds = {}
+for _, entry in ipairs(defaultWarrior.given) do defaultIds[#defaultIds + 1] = entry.entry end
+print("  [测试] 出厂默认奖池发给战士: " .. table.concat(defaultIds, ","))
+assertTrue(hasId(defaultWarrior, 40753),
+    "没有奖池表时出厂默认池照常发奖（池 1「全员奖」100% 的 40753 必须到手）")
+assertTrue(type(findLogLine("回退出厂默认")) == "string", "回落路径写日志（[奖池]...回退出厂默认）")
+
+-- ② 结算韧性：中段（xpcall 内）抛错，收尾必须照做
+recorded.rewardPoolRows = rewardPoolRows({
+    { pool_id = 3, sort_order = 10, name = "韧性池", enabled = 1, chance = 100, winner_mode = "all",
+      winner_count = 1, class_filter = 0, items_text = "1001", gold_min_copper = 0, gold_max_copper = 0, announce = 1 },
+})
+runConsoleCommand("boss config reload")
+assertEq(rewardPoolsSource(), "db", "韧性段：奖池来自表")
+
+local warrior = newPlayer(703, "韧性战士", 1, 0)
+local mage = newPlayer(704, "韧性法师", 8, 0)
+activeBoss = newBoss(777302, 0)
+runConsoleCommand("boss clear")
+local resilienceSpawnMarkers = markersOf(runConsoleCommand("boss spawn force"))
+assertTrue(resilienceSpawnMarkers:find("AGMP_OK", 1, true) ~= nil, "韧性段：生成假 Boss 成功")
+damageHandler(0, activeBoss, warrior, 500)
+damageHandler(0, activeBoss, mage, 500)
+
+local boundary = #recorded.sql
+local scheduledBefore = #scheduledEvents
+local originalPick = env.PickRewardPoolItemFor
+assertTrue(type(originalPick) == "function", "取到全局 PickRewardPoolItemFor（注入点）")
+env.PickRewardPoolItemFor = function() error("injected mid-phase failure") end
+local deathOk, deathErr = pcall(deathHandler, 0, activeBoss, warrior)
+env.PickRewardPoolItemFor = originalPick
+
+assertTrue(deathOk, "发奖中段抛错时 OnBossDied 自身不向外抛（xpcall 收口）：" .. tostring(deathErr))
+local sawFailed, sawGranted, sawSnapshot, sawRespawn, sawErrorLog = false, false, false, false, false
+for index = boundary + 1, #recorded.sql do
+    local sql = recorded.sql[index].sql
+    if sql:find("'reward_failed'", 1, true) then sawFailed = true end
+    if sql:find("'reward_granted'", 1, true) then sawGranted = true end
+    if sql:find("'respawn_scheduled'", 1, true) then sawRespawn = true end
+    if sql:find("`boss_activity_contributors`", 1, true) and sql:find("INSERT", 1, true) then sawSnapshot = true end
+end
+sawErrorLog = findLogLine("结算过程出错") ~= nil
+assertTrue(sawFailed, "中段异常写 event_type='reward_failed'（失败可见）")
+assertTrue(sawGranted, "中段异常仍写 event_type='reward_granted'（已奖励标记在 Finalize 里）")
+assertTrue(sawSnapshot, "中段异常仍写贡献快照（不再出现「无快照」）")
+assertTrue(sawRespawn, "中段异常仍排重生（不再出现「不重生、该 GUID 永久跳过」）")
+assertTrue(sawErrorLog, "中段异常打印错误日志")
+assertTrue(#scheduledEvents > scheduledBefore, "中段异常后 CreateLuaEvent 仍被调用（重生计时）")
+assertTrue(#warrior.given == 0, "注入点在发物品之前，所以这次没有物品入包（符合注入位置）")
+
+-- 收尾跑完 → 状态清理干净，可以立刻再生成一只
+local respawnMarkers = markersOf(runConsoleCommand("boss spawn force"))
+assertTrue(respawnMarkers:find("AGMP_OK", 1, true) ~= nil,
+    "中段异常后状态已清理，可以立刻再生成（没有卡在「已有活跃 Boss」）")
+
+-- 诊断（不改结论）：预备阶段（xpcall 之外）抛错的后果
+boundary = #recorded.sql
+damageHandler(0, activeBoss, warrior, 500)
+local originalIndex = env.BuildClassItemIndex
+env.BuildClassItemIndex = function() error("injected prep-phase failure") end
+local prepOk = pcall(deathHandler, 0, activeBoss, warrior)
+env.BuildClassItemIndex = originalIndex
+local prepGranted, prepSnapshot, prepRespawn = false, false, false
+for index = boundary + 1, #recorded.sql do
+    local sql = recorded.sql[index].sql
+    if sql:find("'reward_granted'", 1, true) then prepGranted = true end
+    if sql:find("'respawn_scheduled'", 1, true) then prepRespawn = true end
+    if sql:find("`boss_activity_contributors`", 1, true) and sql:find("INSERT", 1, true) then prepSnapshot = true end
+end
+io.write(string.format(
+    "  [info] 预备阶段异常（BuildClassItemIndex 在 xpcall 之外）：OnBossDied 是否向外抛=%s / reward_granted=%s / 快照=%s / 重生排程=%s\n",
+    tostring(not prepOk), tostring(prepGranted), tostring(prepSnapshot), tostring(prepRespawn)))
+runConsoleCommand("boss clear")
+
+-- ③ 口径回归：治疗 / 去重 / 巡逻 / 打断预筛 / 区间归一
+io.write("\n== 口径回归（治疗 · 去重 · 巡逻 · 打断 · 区间归一） ==\n")
+
+activeBoss = newBoss(777303, 5)
+runConsoleCommand("boss clear")
+local healSpawnMarkers = markersOf(runConsoleCommand("boss spawn force"))
+assertTrue(healSpawnMarkers:find("AGMP_OK", 1, true) ~= nil, "口径回归段：生成假 Boss 成功")
+local healerSameInstance = newPlayer(705, "同副本奶", 5, 5)
+local healerOtherInstance = newPlayer(706, "别副本奶", 5, 6)
+local farTarget = newPlayer(707, "远处目标", 1, 5)
+farTarget.GetX = function() return 9999 end
+farTarget.GetY = function() return 9999 end
+local offMapPlayer = newPlayer(708, "别的地图", 1, 5)
+offMapPlayer.GetMapId = function() return 530 end
+
+assertTrue(env.IsInActiveEncounterInstance(healerSameInstance) == true,
+    "遭遇范围判定：同 map + 同 instance_id 的玩家算在场")
+assertTrue(env.IsInActiveEncounterInstance(healerOtherInstance) == false,
+    "遭遇范围判定：同 map 但 instance_id 不同（别的副本实例）不算在场")
+assertTrue(env.IsInActiveEncounterInstance(offMapPlayer) == false,
+    "遭遇范围判定：不同 map 不算在场")
+
+local healHandler = engineCallbacks.player["65"]
+damageHandler(0, activeBoss, healerSameInstance, 100)   -- 让它成为参战者
+local contributionStats = bossLocal("bossContributionStats")
+healHandler(0, healerSameInstance, healerSameInstance, 500)
+healHandler(0, healerOtherInstance, healerSameInstance, 700)
+healHandler(0, healerSameInstance, farTarget, 900)
+local healState = contributionStats and contributionStats[777303]
+local sameRecord = healState and healState.players["705"]
+local otherRecord = healState and healState.players["706"]
+assertTrue(sameRecord ~= nil and sameRecord.healingDone == 500,
+    "治疗计入：治疗者本人不在参与半径内也算（只要同副本实例、被治疗者是参战者）")
+assertTrue(otherRecord == nil or otherRecord.healingDone == 0,
+    "治疗不计入：治疗者在别的副本实例")
+assertEq(sameRecord and sameRecord.healingDone, 500,
+    "治疗不计入：被治疗者既不在遭遇范围内也不是参战者（累计仍是 500）")
+
+-- 同 tick 去重：附近玩家列表与威胁列表里重复出现同一个人，只记一份
+local trackPresence = bossLocal("TrackEncounterPresence")
+assertTrue(type(trackPresence) == "function", "按名字取到文件内 local TrackEncounterPresence")
+if type(trackPresence) == "function" then
+    local duplicate = newPlayer(709, "重复玩家", 1, 5)
+    activeBoss.GetPlayersInRange = function() return {duplicate, duplicate} end
+    trackPresence(activeBoss, {duplicate, duplicate})
+    local duplicateRecord = healState and healState.players["709"]
+    assertTrue(duplicateRecord ~= nil, "去重段的玩家进了贡献池")
+    if duplicateRecord ~= nil then
+        assertEq(duplicateRecord.presenceSamples, 1, "同一 tick 内重复出现只记 1 次出勤（列表 + 威胁表不重复累加）")
+        assertEq(duplicateRecord.threatSamples, 1, "同一 tick 内重复出现只记 1 份仇恨样本（宠物与主人算一份）")
+    end
+end
+
+-- 巡逻脱缰中心：必须用 activeBossInfo.homeX/homeY（x/y 会被 AI 每 tick 覆盖成实时坐标）
+local bossConfigTable = bossLocal("BOSS_CONFIG")
+local registerPatrol = bossLocal("RegisterBossPatrol")
+assertTrue(type(bossConfigTable) == "table" and type(registerPatrol) == "function",
+    "取到 BOSS_CONFIG 与 RegisterBossPatrol（巡逻断言用）")
+if type(bossConfigTable) == "table" and type(registerPatrol) == "function" then
+    local previousPatrolEnabled = bossConfigTable.patrolEnabled
+    bossConfigTable.patrolEnabled = true
+
+    -- 上一只还活着，先清干净（HasActiveBoss() 否则会挡住新的生成）
+    runConsoleCommand("boss clear")
+    local patrolBoss = newBoss(777304, 0)
+    activeBoss = patrolBoss
+    local patrolSpawnMarkers = markersOf(runConsoleCommand("boss spawn force"))
+    assertTrue(patrolSpawnMarkers:find("AGMP_OK", 1, true) ~= nil, "巡逻段：生成巡逻用假 Boss 成功")
+    activeBoss.movedHome, activeBoss.movedRandom = false, 0
+
+    local liveInfo = bossLocal("activeBossInfo")
+    assertTrue(type(liveInfo) == "table", "取到 activeBossInfo（巡逻中心断言用）")
+    if type(liveInfo) == "table" then
+        -- 实时坐标（x/y）= 生物当前位置；刷新点（home_*）离它 892 码 > 脱缰半径 77
+        liveInfo.x, liveInfo.y = 4108.16, 5316.85
+        liveInfo.homeX, liveInfo.homeY = 5000.0, 5316.85
+        registerPatrol(activeBoss)
+        local patrolEvent = activeBoss.events[#activeBoss.events]
+        assertTrue(patrolEvent ~= nil and type(patrolEvent.fn) == "function", "巡逻循环已注册")
+        if patrolEvent ~= nil then patrolEvent.fn(0, 1000, 0, activeBoss) end
+        assertTrue(activeBoss.movedHome == true and activeBoss.movedRandom == 0,
+            "脱缰判定用 activeBossInfo.homeX/homeY（若用被覆盖的实时 x/y 会误判成未脱缰并随机巡逻）")
+    end
+
+    bossConfigTable.patrolEnabled = previousPatrolEnabled
+end
+
+-- 打断预筛距离 = 打断池里最远射程（写死 10 会让 25/30 码的打断法术永远选不中）
+local prescreenRange = bossLocal("GetInterruptPrescreenRange")
+local interruptPool = bossLocal("INTERRUPT_SPELL_LIBRARY")
+assertTrue(type(prescreenRange) == "function" and type(interruptPool) == "table",
+    "按名字取到 GetInterruptPrescreenRange / INTERRUPT_SPELL_LIBRARY")
+if type(prescreenRange) == "function" and type(interruptPool) == "table" then
+    local poolMaxRange = 0
+    for _, interruptSpell in ipairs(interruptPool) do
+        local range = tonumber(interruptSpell.maxRange) or 0
+        if range > poolMaxRange then poolMaxRange = range end
+    end
+    assertTrue(poolMaxRange > 10,
+        "打断池里存在 >10 码的法术（预筛写死 10 就会把它们全筛掉）：最远 " .. poolMaxRange .. " 码")
+    assertEq(prescreenRange(), poolMaxRange, "打断预筛距离取自打断池最远射程（不是写死的 10）")
+end
+
+-- (min,max) 写反必须归一：否则 math.random(min,max) 直接抛错，整段玩法消失
+CONFIG_VALUES.minion_count_min, CONFIG_VALUES.minion_count_max = 5, 2
+EXT_VALUES.phase2_summon_count_min, EXT_VALUES.phase2_summon_count_max = 6, 1
+local rangeReloadMarkers, rangeReloadText = markersOf(runConsoleCommand("boss config reload"))
+assertTrue(rangeReloadMarkers:find("AGMP_OK", 1, true) ~= nil,
+    "区间写反时 .boss config reload 仍返回 AGMP_OK（不崩、不丢配置）")
+assertTrue(rangeReloadText:find("写库失败", 1, true) ~= nil, "reload 回执带上写库状态")
+assertTrue(findLogLine("数量区间写反了") ~= nil,
+    "区间写反会打告警日志（" .. tostring(findLogLine("数量区间写反了")) .. "）")
+local minionText = table.concat(runConsoleCommand("boss config show minion"), " | ")
+assertTrue(minionText:find("minion_count_min (minionCountMin) = 5", 1, true) ~= nil
+    and minionText:find("minion_count_max (minionCountMax) = 5", 1, true) ~= nil,
+    "小怪数量区间被归一为 [5,5]（min 不变、max 抬到 min）")
+local phaseRangeText = table.concat(runConsoleCommand("boss config show phase"), " | ")
+assertTrue(phaseRangeText:find("phase2_summon_count_min (phase2SummonCountMin) = 6", 1, true) ~= nil
+    and phaseRangeText:find("phase2_summon_count_max (phase2SummonCountMax) = 6", 1, true) ~= nil,
+    "阶段2援军数量区间被归一为 [6,6]")
+
+-- 复原：区间、桩函数、奖池结果集与活跃 Boss
+CONFIG_VALUES.minion_count_min, CONFIG_VALUES.minion_count_max = 1, 2
+EXT_VALUES.phase2_summon_count_min, EXT_VALUES.phase2_summon_count_max = 3, 4
+env.type, env.PerformIngameSpawn, env.GetPlayerByGUID = savedType, savedSpawn, savedGetPlayer
+recorded.rewardPoolRows = nil
+runConsoleCommand("boss clear")
+runConsoleCommand("boss config reload")
+assertEq(rewardPoolsSource(), "code", "口径回归段结束后奖池来源回到 code（桩结果集已清空）")
+end
+
+-- ------------------------------------------------- 跨重启恢复（运行态说"停服前有一只"）
+-- 三段都必须成立：
+--   1) status ∈ {spawned, engaged} 时加载只置标志，首个 tick 才重建（加载期地图/世界未必就绪）；
+--      重建后血量按 health_pct 折算、技能预设沿用停服前那套、写 runtime_recovered 事件；
+--   2) 时段外 → 不重建，写 runtime_recovered_skipped 并把运行态复位为 idle；
+--   3) 运行态里的 entry 非法 → 写 runtime_recovery_failed + 复位 idle，且**不重试**。
+-- 用"另加载一份 boss.lua"驱动：只有从加载那一刻就带上运行态行，才走得到真正的恢复分支。
+io.write("\n== 跨重启恢复（首个 tick 重建） ==\n")
+do
+-- SQL VALUES 里的单元格带引号与空格：取值统一去引号 + 去首尾空白
+local function scalarValue(text)
+    return (tostring(text or ""):gsub("'", ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- 只从**写入语句**里取值：同一段里还有 CREATE TABLE 与写入后的回读 SELECT（都提及 runtime 表，
+-- 但都没有 VALUES 列清单，直接取会拿到 nil）。
+local function runtimeWriteValue(fromIndex, column, requiredMarker)
+    local found = nil
+    for index = fromIndex, #recorded.sql do
+        local item = recorded.sql[index]
+        if item.kind == "execute" and item.sql:find("boss_activity_runtime", 1, true)
+            and item.sql:find("VALUES", 1, true)
+            and (requiredMarker == nil or item.sql:find(requiredMarker, 1, true) ~= nil) then
+            local value = insertColumnValue(item.sql, column)
+            if value ~= nil then found = value end
+        end
+    end
+    return found
+end
+
+local function withFreshBoss(runtimeValues, envOverrides, run)
+    local savedCreature, savedPlayer = engineCallbacks.creature, engineCallbacks.player
+    local savedRuntimeRow, savedPoolRows = recorded.runtimeRow, recorded.rewardPoolRows
+    local savedScheduledCount = #scheduledEvents
+
+    engineCallbacks.creature, engineCallbacks.player = {}, {}
+    recorded.runtimeRow = runtimeValues
+    recorded.rewardPoolRows = nil
+
+    local childEnv = setmetatable(envOverrides or {}, {__index = env})
+    local childChunk, childLoadErr = loadfile(bossPath, "t", childEnv)
+    local result, runErr = nil, nil
+    if not childChunk then
+        fail("恢复段：副本加载失败: " .. tostring(childLoadErr))
+    else
+        captureGlobalPrint(function()
+            local loadedOk, loadError = pcall(childChunk)
+            if not loadedOk then runErr = loadError end
+        end)
+        if runErr == nil then
+            local ranOk, callError = pcall(function()
+                result = run({
+                    creature = engineCallbacks.creature,
+                    player = engineCallbacks.player,
+                    scheduled = scheduledEvents,
+                    scheduledFrom = savedScheduledCount + 1,
+                    env = childEnv,
+                })
+            end)
+            if not ranOk then runErr = callError end
+        end
+    end
+
+    engineCallbacks.creature, engineCallbacks.player = savedCreature, savedPlayer
+    recorded.runtimeRow, recorded.rewardPoolRows = savedRuntimeRow, savedPoolRows
+
+    if runErr ~= nil then
+        fail("恢复段：副本执行出错: " .. tostring(runErr))
+    end
+    return result
+end
+
+-- 恢复段专用的假 Boss：血量由 SetMaxHealth/SetHealth 真实记录，才能核对 60% 折算
+local function recoveryBoss(guid)
+    local boss = {__fake = true, guid = guid, maxHealth = 1000, health = 1000, yells = {}}
+    boss.IsInWorld = function() return true end
+    boss.IsAlive = function() return true end
+    boss.IsInCombat = function() return false end
+    boss.GetGUIDLow = function() return guid end
+    boss.GetEntry = function() return 190090 end
+    boss.GetName = function() return "送财童子" end
+    boss.GetMapId = function() return 571 end
+    boss.GetInstanceId = function() return 0 end
+    boss.GetX = function() return 4353.573 end
+    boss.GetY = function() return -4411.8877 end
+    boss.GetZ = function() return 151.3909 end
+    boss.GetO = function() return 0 end
+    boss.GetMaxHealth = function() return boss.maxHealth end
+    boss.GetHealth = function() return boss.health end
+    boss.SetMaxHealth = function(_, value) boss.maxHealth = value end
+    boss.SetHealth = function(_, value) boss.health = value end
+    boss.SetLevel = function() end
+    boss.SetScale = function() end
+    boss.SetHomePosition = function() end
+    -- 按模板重算基准血量：UpdateEntry 后模板上限必须可读（1000）
+    boss.UpdateEntry = function() boss.maxHealth = 1000; boss.health = 1000 end
+    boss.AddAura = function() end
+    boss.RemoveAura = function() end
+    boss.SendUnitYell = function(_, message) table.insert(boss.yells, tostring(message)) end
+    boss.RemoveEvents = function() boss.events = {} end
+    boss.RegisterEvent = function() end
+    boss.GetPlayersInRange = function() return {} end
+    boss.GetDistance = function() return 5 end
+    return boss
+end
+
+local function runtimeValues(overrides)
+    local values = {
+        boss_guid = 424242, boss_entry = 190090, boss_name = "送财童子", map_id = 571, instance_id = 0,
+        home_x = 4353.573, home_y = -4411.8877, home_z = 151.3909, phase = 2, status = "spawned",
+        respawn_at = 0, last_spawn_at = 1, last_engage_at = 2, last_death_at = 0, last_reset_at = 0,
+        schedule_state = "open", schedule_window = "20:00-22:00", schedule_next_change_at = 0,
+        health_pct = 60, spawn_point_index = 1, last_health_sample_at = 3,
+        skill_preset = "iron_vanguard", skill_difficulty = "raid",
+    }
+    for key, value in pairs(overrides or {}) do values[key] = value end
+    return runtimeRow(values)
+end
+
+-- 时间段内（20:00-22:00）才能重建
+setNow(os.time{year = 2026, month = 9, day = 1, hour = 21, min = 0, sec = 0})
+
+-- 1) 成功路径：status='spawned' / health_pct=60 / spawn_point_index=1 / skill_preset=iron_vanguard
+local spawnedBoss = recoveryBoss(777201)
+local recoveryRun = withFreshBoss(runtimeValues({}), {
+    PerformIngameSpawn = function() recorded.spawnAttempts = (recorded.spawnAttempts or 0) + 1; return spawnedBoss end,
+}, function(context)
+    local tick = nil
+    for index = context.scheduledFrom, #context.scheduled do
+        if context.scheduled[index].delay == 1000 and context.scheduled[index].repeats == 0 then
+            tick = context.scheduled[index].fn
+        end
+    end
+
+    local loadedLog = findLogLine("[恢复]检测到停服前的活跃 Boss")
+    local sqlBoundary = #recorded.sql
+    local spawnsBefore = recorded.spawnAttempts or 0
+    if tick ~= nil then tick(0, 1000, 0) end
+
+    local recoveredEvent, persistedStatus = false, nil
+    for index = sqlBoundary + 1, #recorded.sql do
+        local sql = recorded.sql[index].sql
+        if sql:find("'runtime_recovered'", 1, true) then recoveredEvent = true end
+    end
+    persistedStatus = runtimeWriteValue(sqlBoundary + 1, "health_pct", "'spawned'")
+
+    return {
+        tickFound = tick ~= nil,
+        loadedLog = loadedLog,
+        spawned = (recorded.spawnAttempts or 0) - spawnsBefore,
+        maxHealth = spawnedBoss.maxHealth,
+        health = spawnedBoss.health,
+        recoveredEvent = recoveredEvent,
+        healthPctPersisted = persistedStatus,
+        presetKey = bossLocal("ACTIVE_SKILL_PRESET_KEY", context),
+        yells = table.concat(spawnedBoss.yells, " | "),
+    }
+end)
+
+assertTrue(recoveryRun ~= nil, "恢复段（成功路径）跑完")
+if recoveryRun ~= nil then
+    assertTrue(recoveryRun.loadedLog ~= nil,
+        "加载期检测到停服前的活跃 Boss 并只置标志（" .. tostring(recoveryRun.loadedLog) .. "）")
+    assertTrue(recoveryRun.tickFound, "恢复段：拿到每秒 tick")
+    assertEq(recoveryRun.spawned, 1, "首个 tick 重建了一只 Boss（PerformIngameSpawn 被调用 1 次）")
+    assertEq(recoveryRun.health, math.floor(recoveryRun.maxHealth * 60 / 100 + 0.5),
+        string.format("血量按 health_pct=60 折算（%d / %d）", recoveryRun.health, recoveryRun.maxHealth))
+    assertTrue(recoveryRun.health < recoveryRun.maxHealth, "折算后血量低于满血（没有被 ApplyBossTraits 回满）")
+    assertEq(recoveryRun.presetKey, "iron_vanguard",
+        "技能预设沿用运行态里那一套（不是回落到配置默认 spellbreak_bulwark）")
+    assertTrue(recoveryRun.recoveredEvent, "重建写入 event_type='runtime_recovered'")
+    assertEq(tonumber(recoveryRun.healthPctPersisted), 60, "重建后把 health_pct 落库（面板运行状态可读）")
+    assertTrue(tostring(recoveryRun.yells):find("DB恢复喊话-60%", 1, true) ~= nil,
+        "恢复喊话里的 {HEALTH_PCT} 被替换（" .. tostring(recoveryRun.yells) .. "）")
+end
+
+-- 2) 时段外：不重建，写 runtime_recovered_skipped 并复位 idle
+setNow(os.time{year = 2026, month = 9, day = 1, hour = 23, min = 0, sec = 0})
+local skippedRun = withFreshBoss(runtimeValues({}), {
+    PerformIngameSpawn = function() recorded.spawnAttempts = (recorded.spawnAttempts or 0) + 1; return nil end,
+}, function(context)
+    local tick = nil
+    for index = context.scheduledFrom, #context.scheduled do
+        if context.scheduled[index].delay == 1000 and context.scheduled[index].repeats == 0 then
+            tick = context.scheduled[index].fn
+        end
+    end
+
+    local sqlBoundary = #recorded.sql
+    local spawnsBefore = recorded.spawnAttempts or 0
+    if tick ~= nil then tick(0, 1000, 0) end
+
+    local skippedEvent = false
+    for index = sqlBoundary + 1, #recorded.sql do
+        if recorded.sql[index].sql:find("'runtime_recovered_skipped'", 1, true) then skippedEvent = true end
+    end
+
+    return {
+        spawned = (recorded.spawnAttempts or 0) - spawnsBefore,
+        skippedEvent = skippedEvent,
+        idleStatus = runtimeWriteValue(sqlBoundary + 1, "status", "'idle'"),
+    }
+end)
+
+assertTrue(skippedRun ~= nil, "恢复段（时段外）跑完")
+if skippedRun ~= nil then
+    assertEq(skippedRun.spawned, 0, "时段外不重建 Boss（0 次生成尝试）")
+    assertTrue(skippedRun.skippedEvent, "时段外写 event_type='runtime_recovered_skipped'")
+    assertEq(scalarValue(skippedRun.idleStatus), "idle", "时段外把运行态复位为 idle")
+end
+
+-- 3) 运行态 entry 非法：写 runtime_recovery_failed + 复位 idle，且不重试
+setNow(os.time{year = 2026, month = 9, day = 1, hour = 21, min = 0, sec = 0})
+local failedRun = withFreshBoss(runtimeValues({boss_entry = 999999}), {
+    PerformIngameSpawn = function() recorded.spawnAttempts = (recorded.spawnAttempts or 0) + 1; return nil end,
+}, function(context)
+    local tick = nil
+    for index = context.scheduledFrom, #context.scheduled do
+        if context.scheduled[index].delay == 1000 and context.scheduled[index].repeats == 0 then
+            tick = context.scheduled[index].fn
+        end
+    end
+
+    local firstBoundary = #recorded.sql
+    local spawnsBefore = recorded.spawnAttempts or 0
+    if tick ~= nil then tick(0, 1000, 0) end
+    local spawnsAfterFirstTick = recorded.spawnAttempts or 0
+
+    local failedEvent = false
+    for index = firstBoundary + 1, #recorded.sql do
+        if recorded.sql[index].sql:find("'runtime_recovery_failed'", 1, true) then failedEvent = true end
+    end
+    local idleAfterFailure = runtimeWriteValue(firstBoundary + 1, "status", "'idle'")
+
+    -- 第二个 tick 必须不再写恢复事件（不重试）
+    local secondBoundary = #recorded.sql
+    local spawnsAfterFirst = recorded.spawnAttempts or 0
+    if tick ~= nil then tick(0, 1000, 0) end
+
+    local retriedEvent, secondSpawn = false, (recorded.spawnAttempts or 0) - spawnsAfterFirst
+    for index = secondBoundary + 1, #recorded.sql do
+        if recorded.sql[index].sql:find("'runtime_recovery_failed'", 1, true)
+            or recorded.sql[index].sql:find("'runtime_recovered'", 1, true) then retriedEvent = true end
+    end
+
+    return {
+        spawned = spawnsAfterFirstTick - spawnsBefore,
+        failedEvent = failedEvent,
+        idleStatus = idleAfterFailure,
+        retriedEvent = retriedEvent,
+        secondSpawn = secondSpawn,
+    }
+end)
+
+assertTrue(failedRun ~= nil, "恢复段（entry 非法）跑完")
+if failedRun ~= nil then
+    assertEq(failedRun.spawned, 0, "entry 非法时不重建（PerformIngameSpawn 未被调用）")
+    assertTrue(failedRun.failedEvent, "写 event_type='runtime_recovery_failed'")
+    assertEq(scalarValue(failedRun.idleStatus), "idle", "失败后运行态复位为 idle")
+    assertTrue(not failedRun.retriedEvent, "失败不在第二个 tick 重试（只写一次恢复事件）")
+    -- 第二个 tick 会回到定时启停的正常分支（时段内 + 没有活跃 Boss → 正常补刷）：这是设计
+    io.write(string.format("  [info] 恢复失败后的第二个 tick：补刷尝试 %d 次（回到定时启停的正常分支，属设计）\n",
+        failedRun.secondSpawn))
+end
+
+assertTrue(findLogLine("[恢复]") ~= nil, "恢复段会写 [恢复] 日志")
+end
+
+-- ------------------------------------------------- 写库失败可见性（BossSql.exec）
+-- CharDBExecute 在 mod-ale 里**没有返回值**，所以"写失败"只能靠 pcall + 回读校验暴露：
+-- 失败要计数、要打印日志、要能从 .boss config reload 的回执里看到，且不能让脚本半死不活。
+io.write("\n== 写库失败可见性 ==\n")
+do
+local bossSql = bossLocal("BossSql")
+assertTrue(type(bossSql) == "table" and type(bossSql.failures) == "table",
+    "取到文件内 local BossSql（写库失败计数）")
+
+local failuresBefore = type(bossSql) == "table" and tonumber(bossSql.failures.count) or 0
+recorded.failNextExecute = true
+local reloadMessages = runConsoleCommand("boss config reload")
+local reloadMarkers, reloadText = markersOf(reloadMessages)
+local failuresAfter = type(bossSql) == "table" and tonumber(bossSql.failures.count) or 0
+
+assertEq(failuresAfter, failuresBefore + 1, "一次写库异常 → 失败计数 +1（失败不会静默）")
+assertTrue(findLogLine("[配置]写库失败[") ~= nil,
+    "写库失败会打印 [配置]写库失败[...] 日志（" .. tostring(findLogLine("[配置]写库失败[")) .. "）")
+assertTrue(reloadMarkers:find("AGMP_OK", 1, true) ~= nil,
+    "一次写库失败不会让 .boss config reload 变成失败（脚本没有半死）")
+assertTrue(reloadText:find("写库失败: " .. tostring(failuresAfter), 1, true) ~= nil,
+    "reload 回执里带上写库失败次数（" .. tostring(failuresAfter) .. " 次），GM 能看到")
+assertEq(recorded.failNextExecute, false, "注入只用一次（后续写入正常）")
+
+-- 回读校验也走同一条路：写入执行成功但读不回来 → 同样计入失败
+local verifiedBefore = tonumber(bossSql.failures.count) or 0
+recorded.runtimeVerifyFails = true
+runConsoleCommand("boss config reload")
+recorded.runtimeVerifyFails = false
+assertTrue((tonumber(bossSql.failures.count) or 0) > verifiedBefore,
+    "写入后回读不到数据也计入失败（语句执行成功 ≠ 数据落地）")
+
+local helpText = table.concat(runConsoleCommand("boss help"), " | ")
+assertTrue(helpText:find("写库失败", 1, true) ~= nil, ".boss help 报告写库失败状态")
+end
 
 -- ------------------------------------------------- 多区绑定（本区库名 / state_key）
 

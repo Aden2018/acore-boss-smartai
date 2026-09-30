@@ -96,7 +96,7 @@ local BOSS_RUNTIME_TABLE = "boss_activity_runtime"           -- 运行态（活�
 local BOSS_EVENT_TABLE = "boss_activity_events"              -- 事件流水
 local BOSS_CONTRIBUTOR_TABLE = "boss_activity_contributors"  -- 贡献快照
 local BOSS_REWARD_POOL_TABLE = "boss_reward_pools"           -- 奖池（任意数量，pool_id 即位号）
-local BOSS_MAX_REWARD_POOLS = 32                             -- 位图上限（reward_pools_mask 是 INT）
+local BOSS_MAX_REWARD_POOLS = 31                             -- 位号上限：reward_pools_mask 是有符号 INT，第 32 位（2^31）会溢出
 local BOSS_SCHEMA_READY = false
 
 -- 多区部署自检：把本区绑定写进本区日志。面板页头也会显示它读的是哪个库，
@@ -2700,12 +2700,31 @@ do
     local NormalizeRewardPools
 
     -- 读结果集（ALEQuery：首行即可读，:NextRow() 返回 false 表示没有下一行）
+    -- ★ 0 行时 ALE 也会返回一个**非 nil** 的结果集（SELECT 有结果集只是没数据），所以必须先判行数：
+    --   否则会把"空结果集"当成一行全空的假行读出来（poolId=0），进而让调用方以为"表里有数据"。
+    local function QueryHasRows(query)
+        if type(query.GetRowCount) == "function" then
+            local ok, count = pcall(function() return query:GetRowCount() end)
+            if ok and tonumber(count) ~= nil then
+                return tonumber(count) > 0
+            end
+        end
+
+        -- 拿不到行数（老引擎/桩环境）：退回"首行 pool_id 是否为 0"的判断
+        return GetQueryUInt(query, 0, 0) > 0
+    end
+
     local function ReadRewardPoolsFromQuery(query)
         local pools = {}
 
         while true do
+            local poolId = GetQueryUInt(query, 0, 0)
+            if #pools == 0 and poolId <= 0 then
+                break
+            end
+
             pools[#pools + 1] = {
-                poolId = GetQueryUInt(query, 0, 0),
+                poolId = poolId,
                 sortOrder = GetQueryInt(query, 1, 0),
                 name = GetQueryRawString(query, 2, ""),
                 enabled = GetQueryUInt(query, 3, 0) == 1,
@@ -2746,6 +2765,11 @@ do
 
             if query == nil then
                 return nil
+            end
+
+            -- 结果集非 nil 但 0 行 = "表在、本区没有行"：返回空表让调用方走播种/回落分支
+            if not QueryHasRows(query) then
+                return {}
             end
 
             return ReadRewardPoolsFromQuery(query)
@@ -4226,9 +4250,9 @@ local function InsertBossContributorSnapshot(source, record, score, rewardedRand
     local context = ResolveBossContext(source)
     local sql = string.format(
         "INSERT INTO `%s`.`boss_activity_contributors` ("
-            .. "`state_key`, `boss_guid`, `boss_entry`, `boss_name`, `player_guid`, `player_name`, `account_id`, `damage_done`, `healing_done`, "
+            .. "`state_key`, `boss_guid`, `boss_entry`, `boss_name`, `player_guid`, `player_name`, `account_id`, `class_id`, `damage_done`, `healing_done`, "
             .. "`threat_samples`, `presence_samples`, `contribution_score`, `was_killer`, `rewarded_random`, `guaranteed_reward`, `reward_pools_mask`, `created_at`) "
-            .. "VALUES ('%s', %d, %d, '%s', %d, '%s', %d, %d, %d, %d, %d, %.6f, %d, %d, %d, %d, %d);",
+            .. "VALUES ('%s', %d, %d, '%s', %d, '%s', %d, %d, %d, %d, %d, %d, %.6f, %d, %d, %d, %d, %d);",
         BOSS_DB_NAME,
         BossSqlEscape(BOSS_RUNTIME_KEY, 32),
         tonumber(context.bossGuid or 0) or 0,
@@ -4237,6 +4261,8 @@ local function InsertBossContributorSnapshot(source, record, score, rewardedRand
         tonumber(record.guidLow or 0) or 0,
         BossSqlEscape(record.name or "", 120),
         tonumber(record.accountId or 0) or 0,
+        -- 职业：离线补发与事后审计都靠它（采样时玩家在线，那时把职业落库）
+        ClampInteger(record.classId or 0, 0, 255),
         tonumber(record.damageDone or 0) or 0,
         tonumber(record.healingDone or 0) or 0,
         tonumber(record.threatSamples or 0) or 0,
@@ -4249,7 +4275,7 @@ local function InsertBossContributorSnapshot(source, record, score, rewardedRand
         tonumber(createdAt or BossNow()) or BossNow()
     )
 
-    CharDBExecute(sql)
+    BossSql.exec(sql, "写贡献快照")
 end
 
 local function PersistBossContributorSnapshots(source, state, rewardedRandomKeys, guaranteedRewardKeys, poolMasks, createdAt)
@@ -6396,7 +6422,7 @@ local function OnBossDied(event, creature, killer)
     local deathActorName = ""
     local deathActorGuid = 0
     local totalFailed = 0
-    local classItemIndex = BuildClassItemIndex()
+    local classItemIndex = {}     -- 在 xpcall 里构建：它抛错也不能把整段结算带出去
 
     local Finalize
 
@@ -6410,6 +6436,16 @@ local function OnBossDied(event, creature, killer)
     print(" [奖励发放]Boss GUID: " .. guid)
 
     local ok, err = xpcall(function()
+        -- 职业映射索引：构建失败（配置数据异常）时退化成空索引——后续按核心 CanUseItem 判定，
+        -- 而不是让整段结算（快照 / 发奖 / 重生排程）被一行抛错带走。
+        local indexOk, builtIndex = pcall(BuildClassItemIndex)
+        if indexOk and type(builtIndex) == "table" then
+            classItemIndex = builtIndex
+        else
+            print(" [奖励发放]警告: 职业映射索引构建失败，本次按核心 CanUseItem 判定奖品可用性："
+                .. tostring(builtIndex))
+        end
+
         contributors, contributionState = BuildContributorRewardPool(guid, killer)
 
         if #contributors > 0 then
