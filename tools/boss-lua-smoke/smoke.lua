@@ -3692,6 +3692,33 @@ else
 end
 
 -- ---------------------------------------------------------------- 10. 主循环接入（结构回归）
+assertTrue(type(env.VerifyBossSchemaContracts) == "function", "批 5：列契约自检可作为全局函数调用")
+if type(env.VerifyBossSchemaContracts) == "function" then
+    local contractOk, contractMissing = env.VerifyBossSchemaContracts()
+    assertTrue(contractOk == true or type(contractMissing) == "table",
+        "批 5：健康快照下列契约自检可正常求值")
+end
+-- 列契约自检与"刚补列"过滤：实机（2026-10-01）发现 information_schema 对刚 ALTER 的列可能滞后读到，
+-- 会把补列成功误报成缺列 → 本轮写库被整轮跳过；这里直接驱动过滤函数核对语义。
+local filterJustAdded = env.FilterJustAddedColumns
+local markJustAdded = env.MarkBossSchemaColumnJustAdded
+assertTrue(type(filterJustAdded) == "function" and type(markJustAdded) == "function",
+    "批 5：取到列契约的「刚补列」过滤函数")
+if type(filterJustAdded) == "function" and type(markJustAdded) == "function" then
+    markJustAdded("smoke_tmp_table", "just_added_col")
+    local remainingMissing = filterJustAdded({
+        "smoke_tmp_table.just_added_col", "smoke_tmp_table.still_missing_col",
+    })
+    assertEq(#remainingMissing, 1, "批 5：刚补成功的列被摘出缺列名单，其余缺列保留")
+    assertEq(remainingMissing[1], "smoke_tmp_table.still_missing_col",
+        "批 5：摘出的正是刚补的那一列（其余缺列仍会上报 → 跳过写库）")
+end
+assertTrue(source:find("FilterJustAddedColumns(missingColumns)", 1, true) ~= nil,
+    "批 5：列契约自检接入「刚补列」过滤（避免 I_S 滞后误报导致跳过写库）")
+assertTrue(source:find("MarkBossSchemaColumnJustAdded(tableName, columnName)", 1, true) ~= nil,
+    "批 5：只有补列 + 回读校验都成功才登记为刚补列（真补失败仍报缺列）")
+assertTrue(source:find("BossSql.record(\"列契约自检\"", 1, true) ~= nil,
+    "批 5：列契约自检失败仍计入写库失败可见性（.boss config show 能看到）")
 assertTrue(source:find("UpdateSoftEnrage(creature, state)", 1, true) ~= nil,
     "批 5：主循环接入软狂暴")
 assertTrue(source:find("if CheckBossWipe(creature, state, currentThreatList, delay) then return end", 1, true) ~= nil,

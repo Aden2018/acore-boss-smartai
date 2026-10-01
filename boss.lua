@@ -1099,7 +1099,7 @@ end
 --  mod-ale 的 `CharDBExecute` **没有返回值**（C++ 侧 `return 0;`，只调 Database.Execute），
 --  所以"检查返回值"这条路不存在。能做的三件事：
 --    1) pcall 包住，捕获语句拼接/参数类型的 Lua 侧异常；
---    2) 写入前用列契约自检挡住 "Unknown column / 表不存在" 这类必然失败；
+--    2) 写入前跑一次列契约自检，缺列时点名告警（不阻断写入：刚补的列可能还没被 information_schema 读到）；
 --    3) 需要时按 verifySql 回读一次（查不到行 = 写入没落地），失败落日志并计数。
 --  失败计数由 `.boss config show`/`.boss config reload` 回执给 GM，避免"面板说已保存、库里没变"。
 local BossSql = {failures = {count = 0, last = "", lastAt = 0}}
@@ -1141,6 +1141,35 @@ DescribeBossSqlFailures = function()
         os.date("%Y-%m-%d %H:%M:%S", tonumber(BossSql.failures.lastAt) or BossNow()))
 end
 
+--  本轮刚补成功的列：`tableName.columnName` 集合。列契约自检要跳过它们 ——
+--  实机复现（2026-10-01，80 区）：刚 ALTER 出来的列，information_schema 可能还要过一会儿才读得到，
+--  自检会把它们误报成"缺列"；而误报会让 BOSS_SCHEMA_READY 保持 false、本轮配置写入被整轮跳过
+--  （首次部署时连引导写入都写不进去）。只登记"补列 + 回读校验都通过"的列；真补失败的不登记、照旧报缺列。
+--  以全局导出（本文件跨区段助手的惯例），避免主 chunk 的 200 个 local 上限。
+BossSchemaJustAddedColumns = {}
+
+MarkBossSchemaColumnJustAdded = function(tableName, columnName)
+    BossSchemaJustAddedColumns[tableName .. "." .. columnName] = true
+end
+
+-- 列契约自检前的过滤：把"本轮刚补成功"的列从缺列名单里摘掉（其余缺列照旧上报 → 跳过写库）。
+FilterJustAddedColumns = function(missingColumns)
+    local remaining, skipped = {}, 0
+    for _, entry in ipairs(missingColumns) do
+        if BossSchemaJustAddedColumns[entry] then
+            skipped = skipped + 1
+        else
+            remaining[#remaining + 1] = entry
+        end
+    end
+
+    if skipped > 0 then
+        print(string.format(" [配置]列契约自检：跳过 %d 个本轮刚补成功的列（information_schema 可能尚未刷新）", skipped))
+    end
+
+    return remaining
+end
+
 local function BossSchemaColumnExists(tableName, columnName)
     local query = CharDBQuery(
         "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '"
@@ -1157,9 +1186,10 @@ end
 
 -- 补列。afterColumn 给定时会用 `AFTER` 把新列插到描述表里的位置（物理列序与描述表一致，
 -- 便于 DBA 复核）；老库缺前置列等异常情况下退回"加到末尾"，不让补列本身失败。
+-- 返回值：(是否可用, 是否本轮刚补成功) —— 第二个值给列契约自检用（见 bossSchemaJustAddedColumns）。
 local function EnsureBossSchemaColumn(tableName, columnName, columnDefinition, afterColumn)
     if BossSchemaColumnExists(tableName, columnName) then
-        return true
+        return true, false
     end
 
     local head = 'ALTER TABLE `' .. BOSS_DB_NAME .. '`.`' .. tableName .. '` ADD COLUMN `' .. columnName .. '` ' .. columnDefinition
@@ -1172,11 +1202,17 @@ local function EnsureBossSchemaColumn(tableName, columnName, columnDefinition, a
 
     if afterColumn ~= nil then
         if BossSql.exec(head .. ' AFTER `' .. afterColumn .. '`;', "补列 " .. tableName .. "." .. columnName, verifySql) then
-            return true
+            MarkBossSchemaColumnJustAdded(tableName, columnName)
+            return true, true
         end
     end
 
-    return BossSql.exec(head .. ';', "补列 " .. tableName .. "." .. columnName, verifySql)
+    if BossSql.exec(head .. ';', "补列 " .. tableName .. "." .. columnName, verifySql) then
+        MarkBossSchemaColumnJustAdded(tableName, columnName)
+        return true, true
+    end
+
+    return false, false
 end
 
 -- 只在列真的存在时才 DROP，所以重复加载/多区加载都是安全的。
@@ -1489,7 +1525,11 @@ local function EnsureBossExtTableColumns()
         if index > 1 then
             afterColumn = BOSS_CONFIG_SCHEMA_EXT[index - 1].column
         end
-        EnsureBossSchemaColumn(BOSS_EXT_TABLE, descriptor.column, descriptor.ddl or 'TEXT NULL', afterColumn)
+        local _, justAdded = EnsureBossSchemaColumn(
+            BOSS_EXT_TABLE, descriptor.column, descriptor.ddl or 'TEXT NULL', afterColumn)
+        if justAdded then
+            MarkBossSchemaColumnJustAdded(BOSS_EXT_TABLE, descriptor.column)
+        end
     end
 end
 
@@ -1674,8 +1714,17 @@ local function EnsureBossSchema(force)
         DropBossSchemaColumn(BOSS_MAIN_TABLE, legacyColumn)
     end
 
-    -- 列契约自检通过后才置 READY：否则"面板显示已保存、库里其实没这一列"会一直静默下去。
+    --  列契约自检：缺列时点名告警并跳过本轮写库。
+    --  为什么是"跳过"而不是"试着写"：核心 DB 层把 1054/1146（Unknown column / 表不存在）当**致命错误**
+    --  直接 ABORT 整个 worldserver（src/server/database/Database/MySQLConnection.cpp 的 ER_BAD_FIELD_ERROR 分支），
+    --  所以带上缺列的写语句不是"失败可见"，而是崩服。
+    --  误报的处理：本轮刚补成功的列（回读校验已通过）从缺列名单里摘掉 —— 实机复现过 information_schema 滞后。
     local schemaOk, missingColumns = VerifyBossSchemaContracts()
+    if not schemaOk then
+        missingColumns = FilterJustAddedColumns(missingColumns)
+        schemaOk = #missingColumns == 0
+    end
+
     if not schemaOk then
         bossSchemaRetryAt = BossNow() + 60
         BossSql.record("列契约自检", table.concat(missingColumns, ", "))

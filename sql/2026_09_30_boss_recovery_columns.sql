@@ -7,7 +7,7 @@
 --
 --  本脚本只加列（幂等，可重复执行），业务逻辑在 boss.lua 里：
 --    1. `boss_activity_runtime`：health_pct / spawn_point_index / last_health_sample_at
---    2. `boss_activity_contributors`：class_id（离线补发按职业过滤奖品用）
+--    2. `boss_activity_contributors`：class_id（离线补发按职业过滤奖品用）+ reward_pools_mask（奖池中奖位图）
 --    3. `boss_activity_config_ext`：recovery 组 3 列 + reward 组 2 列
 --       （新列插在 schedule 三列之前，与 boss.lua 的描述表列序一致）
 --
@@ -54,8 +54,11 @@ CALL boss_add_column_if_missing('boss_activity_runtime', 'health_pct', 'INT NOT 
 CALL boss_add_column_if_missing('boss_activity_runtime', 'spawn_point_index', 'INT NOT NULL DEFAULT -1', 'health_pct');
 CALL boss_add_column_if_missing('boss_activity_runtime', 'last_health_sample_at', 'INT NOT NULL DEFAULT 0', 'spawn_point_index');
 
--- --------------------------------------------------------------------------- 2. 贡献快照：职业（离线补发用）
+-- --------------------------------------------------------------------------- 2. 贡献快照：职业 + 奖池中奖位图
 CALL boss_add_column_if_missing('boss_activity_contributors', 'class_id', 'TINYINT NOT NULL DEFAULT 0', 'account_id');
+-- 位图：第 k-1 位 = 该玩家中过 pool_id=k 的池（有符号 INT，故位号上限 31）。
+-- 脚本加载时也会自举这一列；DBA 预建（不启动 worldserver 就上线面板）时必须一起给，否则脚本的列契约自检会点名。
+CALL boss_add_column_if_missing('boss_activity_contributors', 'reward_pools_mask', 'INT NOT NULL DEFAULT 0', 'guaranteed_reward');
 
 -- --------------------------------------------------------------------------- 3. 扩展配置：recovery 组 + reward 组
 -- 锚点用老库里一定存在的列（managed_tier_entries_text），不依赖 skill_random 两列（老库可能没有）
@@ -78,9 +81,10 @@ FROM information_schema.COLUMNS
 WHERE TABLE_SCHEMA = @boss_db AND TABLE_NAME = 'boss_activity_runtime'
   AND COLUMN_NAME IN ('health_pct', 'spawn_point_index', 'last_health_sample_at')
 UNION ALL
-SELECT 'contributors.class_id（应为 1）', COUNT(*)
+SELECT 'contributors 新列（应为 2）', COUNT(*)
 FROM information_schema.COLUMNS
-WHERE TABLE_SCHEMA = @boss_db AND TABLE_NAME = 'boss_activity_contributors' AND COLUMN_NAME = 'class_id'
+WHERE TABLE_SCHEMA = @boss_db AND TABLE_NAME = 'boss_activity_contributors'
+  AND COLUMN_NAME IN ('class_id', 'reward_pools_mask')
 UNION ALL
 SELECT 'ext 新列（应为 5）', COUNT(*)
 FROM information_schema.COLUMNS

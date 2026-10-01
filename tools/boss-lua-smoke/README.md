@@ -32,7 +32,7 @@ cd <acore-boss-smartai>\tools\boss-lua-smoke
 
 ## 覆盖范围
 
-575 条断言（输出里的 `[ ok ]` 行数，下表按主题归并执行）；`.boss config show` 报出的**配置**分组是 26 组。
+583 条断言（输出里的 `[ ok ]` 行数，下表按主题归并执行）；`.boss config show` 报出的**配置**分组是 26 组。
 
 | 断言组 | 内容 |
 |---|---|
@@ -58,7 +58,7 @@ cd <acore-boss-smartai>\tools\boss-lua-smoke
 | 写库失败可见性 | `CharDBExecute` 抛错一次 → `BossSql.failures.count` +1、打印 `[配置]写库失败[...]`、`.boss config reload` 仍返回 `AGMP_OK` 且回执里带上失败次数；"语句执行成功但回读不到"同样计入失败；`.boss help` 报告失败状态 |
 | 放行 / 副作用 / 事件 | 非 boss 命令返回 `true` 且不产生回复；`.boss clear` 写 `command_clear` 并复位 runtime；`PLAYER_EVENT_ON_HEAL(42/65)` 与受管 entry（含 ext 额外指定的档位）的 6 个 creature 事件全部注册 |
 | 多区绑定 | 把 §2 的两个 key 改写后重新加载：事件写入、runtime 语句与**奖池查询**都必须带新的 key，启动日志报出新 key，共用库名不变，老库自动补 `state_key` 列与索引；任何一处写死 `'current'` 都会失败（默认 key 与被改写 key 两种跑法都必须 PASS） |
-| 批 5 手感与机制 | 键值配置（`skill_condition_thresholds_text` / `target_score_weights_text` / `announce_texts_text`）逐键读取、没写到的键回退脚本默认；条件阈值与评分权重真的参与判定（阈值 5 时 4 个敌人不成立、5 个成立）；威胁因子开关前后评分变化；终选分差窗口（0 = 只取最高分、25% 窗口内两者都可能、分差 100 vs 50 时只取最高）；软狂暴按起算时间叠层、施放强化法术、移速 = 基准 × (1 + 每层% × 层数)、喊话取自库、层数不超上限；团灭判定（宽限期内不停手、到点后 `AttackStop` + `ClearThreatList` + 回血到库值 + 喊话、表里还有存活单位则计时清零）；点名预警（挂标记光环 + 喊话 + 暂不出手、延迟到点才施放原技能、出手后记账与清状态、非 victim 与关闭开关时不预警）；`skill_instant_cast` 决定 `CastSpell` 的触发式参数；条目启停把被禁用的 spellId 从技能池 / 开场技能 / 连招三处剔除且清空后恢复原样；主循环接入（软狂暴 / 团灭 / 预警结算 / 读条移动门控）与三处世界公告调用点做源码结构回归 |
+| 批 5 手感与机制 | 键值配置（`skill_condition_thresholds_text` / `target_score_weights_text` / `announce_texts_text`）逐键读取、没写到的键回退脚本默认；条件阈值与评分权重真的参与判定（阈值 5 时 4 个敌人不成立、5 个成立）；威胁因子开关前后评分变化；终选分差窗口（0 = 只取最高分、25% 窗口内两者都可能、分差 100 vs 50 时只取最高）；软狂暴按起算时间叠层、施放强化法术、移速 = 基准 × (1 + 每层% × 层数)、喊话取自库、层数不超上限；团灭判定（宽限期内不停手、到点后 `AttackStop` + `ClearThreatList` + 回血到库值 + 喊话、表里还有存活单位则计时清零）；点名预警（挂标记光环 + 喊话 + 暂不出手、延迟到点才施放原技能、出手后记账与清状态、非 victim 与关闭开关时不预警）；`skill_instant_cast` 决定 `CastSpell` 的触发式参数；条目启停把被禁用的 spellId 从技能池 / 开场技能 / 连招三处剔除且清空后恢复原样；列契约自检的「刚补列」过滤（刚补成功的列被摘出缺列名单、其余缺列保留）；主循环接入（软狂暴 / 团灭 / 预警结算 / 读条移动门控）与三处世界公告调用点做源码结构回归 |
 
 ## 已知缺口（离线测不到的 / 需要 boss.lua 侧决定的）
 
