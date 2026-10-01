@@ -62,12 +62,11 @@ cd <acore-boss-smartai>\tools\boss-lua-smoke
 
 ## 已知缺口（离线测不到的 / 需要 boss.lua 侧决定的）
 
-本测试不断言下面三件事为"通过"，而是打印 `[info]` 供人工裁决（改 boss.lua 后这些 `[info]` 会跟着变）：
+本测试不断言下面这些为"通过"，而是打印 `[info]` 供人工裁决（改 boss.lua 后这些 `[info]` 会跟着变）：
 
-- **贡献快照不写 `class_id`**：列在 DDL / 列契约自检 / 内存记录里都有，但 `boss_activity_contributors` 的 INSERT 列清单里没有它 → 落库恒为 0（同场次的离线补发用内存里的 `classId`，不受影响；用 DB 行回补职业过滤会失真）。
 - **预备阶段异常不受保护**：`BuildClassItemIndex()` 在 `xpcall` **之外**调用，它抛错会直接中断 `OnBossDied` → 没有 `reward_granted`、没有快照、不排重生。
-- **奖池表的"0 行结果集"分支不可达**：`ReadRewardPoolsFromQuery` 对非 nil 的 query 总会先读一次首行，所以 `#pools > 0` 恒成立；`boss_reward_pools` 存在但本区没有行时既不会播种出厂默认、也不会回落到 `code`，而是得到 0 个池（发不出奖）。只有"查询返回 nil（表不存在）"才走得到回落分支。
 - 引擎侧无法离线复现的部分：`SendMail` / `ModifyMoney` / `PerformIngameSpawn` 的真实副作用、ALE 结果集"首行即可读"的实际时序、以及 `GetMaxHealth` 等模板数值。
+- 结构自举的边界（实机验证过、离线只能验到"脚本发起了 ALTER"）：脚本会给**缺失的表**建表、按显式清单补缺失的列（扩展表全部 82 列 + 运行态 6 + 贡献表 11 + 事件表 `state_key` + 主表 `spawn_points_text`）与 5 个 `state_key` 索引，但**不比对列的类型/默认值/长度**，也**不补主表其余 22 个"面板共享列"**；而核心对 1054/1146 是致命错误（`MySQLConnection::_HandleMySQLErrno` 直接 `ABORT`），所以"缺了脚本会 SELECT 的列"的后果是**进程退出**，不是日志告警。
 
 ## 配置一致性（重构时用的一次性工具，不在本目录）
 

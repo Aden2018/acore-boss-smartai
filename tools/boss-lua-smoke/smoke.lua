@@ -2239,9 +2239,12 @@ assertTrue(sawSnapshot, "结算写入贡献快照（boss_activity_contributors�
 assertTrue(sawRespawnScheduled, "结算写入 event_type='respawn_scheduled'")
 assertEq(respawnDelay, 600000, "结算后按 respawn_time_minutes 排出重生计时（CreateLuaEvent 600000ms）")
 
+-- 职业与奖池位图都必须落库：离线补发与面板按 DB 行回补时依赖它们
 local snapshotClassId = snapshotValue("测试战士", "class_id")
-io.write(string.format("  [info] 贡献快照 class_id = %s（列在 DDL / 列契约自检里，但 INSERT 列清单里没有它）\n",
-    tostring(snapshotClassId)))
+assertTrue(snapshotClassId ~= nil and tonumber(snapshotClassId) > 0,
+    "贡献快照把 class_id 落库（离线补发与面板回补按职业过滤要用，实际 " .. tostring(snapshotClassId) .. "）")
+local snapshotMask = snapshotValue("测试战士", "reward_pools_mask")
+assertTrue(snapshotMask ~= nil, "贡献快照把 reward_pools_mask 落库（面板位图徽章要用）")
 
 
 -- ------------------------------------------------- 离线补发（邮件通道）
