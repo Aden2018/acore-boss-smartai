@@ -375,6 +375,28 @@ local BOSS_CONFIG = {
             "战斗拖得越久，你们越没胜算！",
             "我的耐心是有限的！",
         },
+
+        -- 软狂暴喊话（按层数递进，超出末条后循环最后一条）
+        softEnrageYells = {
+            "时间到了，我不再留手！",
+            "怒火在烧，你们撑不住多久了！",
+            "越来越强了，感觉到了吗？",
+            "这是最后一层怒火，受着吧！",
+        },
+
+        -- 团灭判定喊话（威胁表全灭时喊）
+        wipeYells = {
+            "就这点本事？回去练练再来！",
+            "全躺下了，真是无趣。",
+            "没人站着了吗？那我继续睡了。",
+        },
+
+        -- 点名预警喊话（施法前预警，{PLAYER_NAME} = 被点名者）
+        markerWarningYells = {
+            "{PLAYER_NAME}，盯上你了！",
+            "别动，{PLAYER_NAME}，这一下是给你的！",
+            "{PLAYER_NAME}，躲得掉算你厉害！",
+        },
     },
     
     -- ---- [taunts] 喊话冷却与触发概率 ----
@@ -452,6 +474,58 @@ local BOSS_CONFIG = {
     -- ---- [reward] 结算口径（落库在扩展表） ----
     lastHitOnlyQualifies = false,      -- 只有最后一击、没有任何其它贡献的玩家是否算有效参战
     offlineRewardDelivery = true,      -- 击杀时不在线的贡献者用邮件补发（物品 + 金币）
+
+    -- ---- [feel_skill] 技能手感（落库在扩展表） ----
+    skillInstantCast = false,          -- false = 副本式读条（有前摇、可被打断）；true = 触发式瞬发
+    comboTriggerChancePct = 100,       -- 连招触发率的百分比系数（100 = 保持预设值，50 = 减半）
+    comboGlobalCooldownSeconds = 5,    -- 命中一次连招后的全局连招冷却（秒）
+    skillPickRandomTop = 2,            -- 技能选择：在优先级最高的前 N 条里随机（1 = 总是最高优先级）
+    skillConditionThresholds = {       -- 条件阈值（键 = 条件名，值 = 数值）；未列出的键回退脚本默认
+        multi_target = "1", multi_melee = "1", multi_melee_range = "8",
+        low_hp = "50", critical_hp = "20",
+        surrounded = "3", many_attackers = "4",
+        distant_target = "12", low_hp_target = "25",
+        grouped_targets = "2", grouped_range = "8", kiting_target_range = "8",
+    },
+    disabledSkills = {},               -- 每预设禁用条目（键 = 预设 key，值 = 被禁用的 spellId 列表）
+
+    -- ---- [feel_target] 目标选择（落库在扩展表） ----
+    targetRandomSpreadPct = 25,        -- 终选随机窗口：评分不低于最高分 (1-N%) 的候选里随机（0 = 只取最高分）
+    threatFactorEnabled = true,        -- 目标评分是否计入威胁值（坦克仇恨重新成为目标选择因子）
+    targetScoreWeights = {             -- 评分权重（键 = 权重名，值 = 数值）；未列出的键回退脚本默认
+        base = "50", dist_near = "30", dist_far = "20", dist_near_range = "5", dist_far_range = "20",
+        class_healer = "40", class_ranged = "20", class_melee = "10",
+        hp_low = "25", hp_mid = "15", hp_low_threshold = "30", hp_mid_threshold = "50",
+        casting = "50", prefer_type = "50", threat = "60", interrupt = "100",
+    },
+
+    -- ---- [enrage] 软狂暴（落库在扩展表） ----
+    softEnrageEnabled = false,         -- 战斗超过 softEnrageSeconds 后按间隔叠加强化
+    softEnrageSeconds = 300,           -- 进入软狂暴的战斗时长（秒）
+    softEnrageIntervalSec = 30,        -- 每层强化的间隔（秒）
+    softEnrageSpellId = 8599,          -- 每层强化施放的法术（0 = 只叠层与喊话）；8599 = 激怒
+    softEnrageSpeedPct = 5,            -- 每层提升的移动速度百分比
+    softEnrageMaxStacks = 10,          -- 软狂暴层数上限
+
+    -- ---- [wipe] 团灭判定（落库在扩展表） ----
+    wipeDetectEnabled = true,          -- 威胁表全灭时停手、回血、喊话（让 Boss 会"赢"）
+    wipeGraceSec = 12,                 -- 连续多少秒没有存活敌对单位才算团灭
+    wipeResetHealthPct = 100,          -- 团灭后回血到的血量百分比
+
+    -- ---- [announce] 世界公告（落库在扩展表） ----
+    announceSpawnEnabled = true,       -- 生成时发世界公告
+    announcePhaseEnabled = true,       -- 阶段切换时发世界公告
+    announceRestoreEnabled = true,     -- 跨重启恢复时发世界公告
+    announceTexts = {                  -- 公告文案（键 = spawn / phase / restore，值 = 文案，一行一条）
+        spawn = "{BOSS_NAME} 已现身，集结讨伐！",
+        phase = "{BOSS_NAME} 进入第 {PHASE} 阶段！",
+        restore = "{BOSS_NAME} 卷土重来（血量 {HEALTH_PCT}%）。",
+    },
+
+    -- ---- [marker] 点名预警（落库在扩展表） ----
+    markerWarningEnabled = true,       -- 单体点名技能出手前先挂标记光环 + 喊话
+    markerWarningDelaySec = 2,         -- 预警到真正出手的延迟（秒）
+    markerWarningSpellId = 0,          -- 预警标记光环法术（0 = 只喊话不挂光环）
 }
 
 -- ---- [spawnpoints] 刷新点：Boss 重生时随机选取的坐标 ----
@@ -651,6 +725,12 @@ local BOSS_CONFIG_GROUPS = {
     reward = "奖励与结算",
     recovery = "跨重启恢复",
     tier = "受管模板",
+    feel_skill = "技能手感",
+    feel_target = "目标选择",
+    enrage = "软狂暴",
+    wipe = "团灭判定",
+    announce = "世界公告",
+    marker = "点名预警",
 }
 
 local BOSS_CONFIG_GROUP_ORDER = {
@@ -658,6 +738,7 @@ local BOSS_CONFIG_GROUP_ORDER = {
     "skill", "skill_random", "respawn", "spawnpoints", "schedule", "helper", "reward",
     "recovery",
     "class_ai", "class_reward", "tier",
+    "feel_skill", "feel_target", "enrage", "wipe", "announce", "marker",
 }
 
 --  配置项 → 数据库列 描述表（配置与数据库之间唯一的映射来源）
@@ -854,13 +935,76 @@ local BOSS_CONFIG_SCHEMA_EXT = {
       ddl = "TINYINT NOT NULL DEFAULT 0", target = "BOSS_CONFIG", key = "lastHitOnlyQualifies" },
     { group = "reward", column = "offline_reward_delivery", kind = "bool",
       ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "offlineRewardDelivery" },
-    -- schedule（定时启停：列加在描述表末尾，面板 ext_fields 也必须加在末尾，列序要一致）
+    -- schedule（定时启停：列序与面板 ext_fields、DBA 预建 DDL 逐列一致，新列一律追加在表尾）
     { group = "schedule", column = "activity_schedule_enabled", kind = "bool",
       ddl = "TINYINT NOT NULL DEFAULT 0", target = "BOSS_CONFIG", key = "scheduleEnabled" },
     { group = "schedule", column = "activity_schedule_windows", kind = "text",
       ddl = "VARCHAR(255) NOT NULL DEFAULT ''", target = "BOSS_CONFIG", key = "scheduleWindows" },
     { group = "schedule", column = "activity_schedule_clear_on_close", kind = "bool",
       ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "scheduleClearOnClose" },
+    -- feel_skill：技能手感（读条/瞬发、连招触发率、技能选取随机窗口、条件阈值、条目启停）
+    { group = "feel_skill", column = "skill_instant_cast", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 0", target = "BOSS_CONFIG", key = "skillInstantCast" },
+    { group = "feel_skill", column = "combo_trigger_chance_pct", kind = "int", min = 0, max = 300,
+      ddl = "INT NOT NULL DEFAULT 100", target = "BOSS_CONFIG", key = "comboTriggerChancePct" },
+    { group = "feel_skill", column = "combo_global_cooldown_seconds", kind = "int", min = 0, max = 600,
+      ddl = "INT NOT NULL DEFAULT 5", target = "BOSS_CONFIG", key = "comboGlobalCooldownSeconds" },
+    { group = "feel_skill", column = "skill_pick_random_top", kind = "int", min = 1, max = 10,
+      ddl = "INT NOT NULL DEFAULT 2", target = "BOSS_CONFIG", key = "skillPickRandomTop" },
+    { group = "feel_skill", column = "skill_condition_thresholds_text", kind = "keyedlines", keepDefaultWhenEmpty = true,
+      ddl = "TEXT NULL", target = "CONDITION_THRESHOLDS" },
+    { group = "feel_skill", column = "skill_disabled_spells_text", kind = "keyedlines", keepDefaultWhenEmpty = true,
+      ddl = "TEXT NULL", target = "DISABLED_SKILLS" },
+    -- feel_target：目标选择（终选随机窗口、威胁因子、评分权重）
+    { group = "feel_target", column = "target_random_spread_pct", kind = "int", min = 0, max = 100,
+      ddl = "INT NOT NULL DEFAULT 25", target = "BOSS_CONFIG", key = "targetRandomSpreadPct" },
+    { group = "feel_target", column = "threat_factor_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "threatFactorEnabled" },
+    { group = "feel_target", column = "target_score_weights_text", kind = "keyedlines", keepDefaultWhenEmpty = true,
+      ddl = "TEXT NULL", target = "TARGET_SCORE_WEIGHTS" },
+    -- enrage：软狂暴
+    { group = "enrage", column = "soft_enrage_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 0", target = "BOSS_CONFIG", key = "softEnrageEnabled" },
+    { group = "enrage", column = "soft_enrage_seconds", kind = "int", min = 30, max = 7200,
+      ddl = "INT NOT NULL DEFAULT 300", target = "BOSS_CONFIG", key = "softEnrageSeconds" },
+    { group = "enrage", column = "soft_enrage_interval_seconds", kind = "int", min = 5, max = 600,
+      ddl = "INT NOT NULL DEFAULT 30", target = "BOSS_CONFIG", key = "softEnrageIntervalSec" },
+    { group = "enrage", column = "soft_enrage_spell_id", kind = "int", min = 0, max = 2000000,
+      ddl = "INT NOT NULL DEFAULT 8599", target = "BOSS_CONFIG", key = "softEnrageSpellId" },
+    { group = "enrage", column = "soft_enrage_speed_pct_per_stack", kind = "int", min = 0, max = 200,
+      ddl = "INT NOT NULL DEFAULT 5", target = "BOSS_CONFIG", key = "softEnrageSpeedPct" },
+    { group = "enrage", column = "soft_enrage_max_stacks", kind = "int", min = 1, max = 100,
+      ddl = "INT NOT NULL DEFAULT 10", target = "BOSS_CONFIG", key = "softEnrageMaxStacks" },
+    -- wipe：团灭判定
+    { group = "wipe", column = "wipe_detect_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "wipeDetectEnabled" },
+    { group = "wipe", column = "wipe_grace_seconds", kind = "int", min = 3, max = 300,
+      ddl = "INT NOT NULL DEFAULT 12", target = "BOSS_CONFIG", key = "wipeGraceSec" },
+    { group = "wipe", column = "wipe_reset_health_pct", kind = "int", min = 1, max = 100,
+      ddl = "INT NOT NULL DEFAULT 100", target = "BOSS_CONFIG", key = "wipeResetHealthPct" },
+    -- announce：世界公告（生成 / 阶段 / 恢复）
+    { group = "announce", column = "announce_spawn_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "announceSpawnEnabled" },
+    { group = "announce", column = "announce_phase_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "announcePhaseEnabled" },
+    { group = "announce", column = "announce_restore_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "announceRestoreEnabled" },
+    { group = "announce", column = "announce_texts_text", kind = "keyedlines", keepDefaultWhenEmpty = true,
+      ddl = "TEXT NULL", target = "ANNOUNCE_TEXTS" },
+    -- marker：点名预警
+    { group = "marker", column = "marker_warning_enabled", kind = "bool",
+      ddl = "TINYINT NOT NULL DEFAULT 1", target = "BOSS_CONFIG", key = "markerWarningEnabled" },
+    { group = "marker", column = "marker_warning_delay_seconds", kind = "int", min = 0, max = 10,
+      ddl = "INT NOT NULL DEFAULT 2", target = "BOSS_CONFIG", key = "markerWarningDelaySec" },
+    { group = "marker", column = "marker_warning_spell_id", kind = "int", min = 0, max = 2000000,
+      ddl = "INT NOT NULL DEFAULT 0", target = "BOSS_CONFIG", key = "markerWarningSpellId" },
+    -- taunts：新增三组喊话（归入 taunts 分组，物理列追加在表尾，列序与面板 ext_fields 一致）
+    { group = "taunts", column = "taunt_soft_enrage_yells_text", kind = "lines",
+      ddl = "TEXT NULL", target = "TAUNTS", key = "softEnrageYells" },
+    { group = "taunts", column = "taunt_wipe_yells_text", kind = "lines",
+      ddl = "TEXT NULL", target = "TAUNTS", key = "wipeYells" },
+    { group = "taunts", column = "taunt_marker_warning_yells_text", kind = "lines",
+      ddl = "TEXT NULL", target = "TAUNTS", key = "markerWarningYells" },
 }
 
 --  配置目标注册表：描述表的 target/key 通过这里落到具体的 Lua 表/变量
@@ -888,6 +1032,22 @@ RegisterConfigTarget("TAUNTS",
 RegisterConfigTarget("REWARD_PROBABILITIES",
     function(key) return REWARD_PROBABILITIES[key] end,
     function(key, value) REWARD_PROBABILITIES[key] = value end)
+
+RegisterConfigTarget("CONDITION_THRESHOLDS",
+    function() return BOSS_CONFIG.skillConditionThresholds end,
+    function(_, value) BOSS_CONFIG.skillConditionThresholds = value end)
+
+RegisterConfigTarget("DISABLED_SKILLS",
+    function() return BOSS_CONFIG.disabledSkills end,
+    function(_, value) BOSS_CONFIG.disabledSkills = value end)
+
+RegisterConfigTarget("TARGET_SCORE_WEIGHTS",
+    function() return BOSS_CONFIG.targetScoreWeights end,
+    function(_, value) BOSS_CONFIG.targetScoreWeights = value end)
+
+RegisterConfigTarget("ANNOUNCE_TEXTS",
+    function() return BOSS_CONFIG.announceTexts end,
+    function(_, value) BOSS_CONFIG.announceTexts = value end)
 
 -- 奖池不再是配置列：内容全部来自 boss_reward_pools 表（见 LoadRewardPoolsFromDB）。
 RegisterConfigTarget("SPAWN_POINTS",
@@ -2084,6 +2244,108 @@ local function ParsePositiveIntegerList(text)
     return values
 end
 
+-- ---------------------------------------------------------------- 手感参数读取
+-- 条件阈值 / 评分权重 / 条目启停都是 keyedlines（值按字符串落库），读取时转数字并回退脚本默认值。
+-- 这些助手以全局函数/表导出（本文件跨区段助手的惯例），避免主 chunk 的 200 个 local 上限。
+BossFeelDefaults = {
+    conditionThresholds = {
+        multi_target = 1, multi_melee = 1, multi_melee_range = 8,
+        low_hp = 50, critical_hp = 20,
+        surrounded = 3, many_attackers = 4,
+        distant_target = 12, low_hp_target = 25,
+        grouped_targets = 2, grouped_range = 8, kiting_target_range = 8,
+    },
+    scoreWeights = {
+        base = 50, dist_near = 30, dist_far = 20, dist_near_range = 5, dist_far_range = 20,
+        class_healer = 40, class_ranged = 20, class_melee = 10,
+        hp_low = 25, hp_mid = 15, hp_low_threshold = 30, hp_mid_threshold = 50,
+        casting = 50, prefer_type = 50, threat = 60, interrupt = 100,
+    },
+}
+
+BossFeelReadMapNumber = function(map, key, fallback)
+    if type(map) == "table" then
+        local numericValue = tonumber(map[key])
+        if numericValue then
+            return numericValue
+        end
+    end
+
+    return fallback
+end
+
+-- 条件阈值（[feel_skill].skill_condition_thresholds_text，键见 BossFeelDefaults.conditionThresholds）
+GetConditionThreshold = function(key)
+    return BossFeelReadMapNumber(BOSS_CONFIG.skillConditionThresholds, key,
+        BossFeelDefaults.conditionThresholds[key] or 0)
+end
+
+-- 目标评分权重（[feel_target].target_score_weights_text，键见 BossFeelDefaults.scoreWeights）
+GetScoreWeight = function(key)
+    return BossFeelReadMapNumber(BOSS_CONFIG.targetScoreWeights, key,
+        BossFeelDefaults.scoreWeights[key] or 0)
+end
+
+-- 条目启停（[feel_skill].skill_disabled_spells_text）：键 = 预设 key，值 = 逗号分隔的 spellId
+GetDisabledSkillSet = function(presetKey)
+    local disabled = {}
+    local map = BOSS_CONFIG.disabledSkills
+    if type(map) ~= "table" or not presetKey then
+        return disabled
+    end
+
+    for _, spellId in ipairs(ParsePositiveIntegerList(map[presetKey])) do
+        disabled[spellId] = true
+    end
+
+    return disabled
+end
+
+-- 世界公告（[announce] 组）：事件开关与文案都落库，占位符由调用方提供
+BossAnnounce = function(eventKey, placeholders)
+    local enabled = false
+    if eventKey == "spawn" then
+        enabled = BOSS_CONFIG.announceSpawnEnabled == true
+    elseif eventKey == "phase" then
+        enabled = BOSS_CONFIG.announcePhaseEnabled == true
+    elseif eventKey == "restore" then
+        enabled = BOSS_CONFIG.announceRestoreEnabled == true
+    end
+
+    if not enabled then return false end
+
+    local template = type(BOSS_CONFIG.announceTexts) == "table" and BOSS_CONFIG.announceTexts[eventKey] or nil
+    if not template or template == "" then return false end
+
+    local message = tostring(template)
+    if type(placeholders) == "table" then
+        for key, value in pairs(placeholders) do
+            message = string.gsub(message, "{" .. key .. "}", tostring(value or ""))
+        end
+    end
+
+    print(" [公告] " .. message)
+    if type(SendWorldMessage) == "function" then
+        SendWorldMessage(message)
+    end
+
+    return true
+end
+
+-- 当前 Boss 显示名（公告与日志用）
+GetBossDisplayName = function(creature)
+    if activeBossInfo and activeBossInfo.name then
+        return activeBossInfo.name
+    end
+
+    local success, name = pcall(function() return creature and creature:GetName() end)
+    if success and name then
+        return name
+    end
+
+    return "活动Boss"
+end
+
 local function SerializePositiveIntegerList(values)
     local parts = {}
     if type(values) ~= "table" then
@@ -2334,19 +2596,75 @@ local function GetSkillDifficultyChoices()
     return table.concat(choices, ", ")
 end
 
-local function BuildScaledPreset(preset, difficulty)
+local function BuildScaledPreset(preset, difficulty, presetKey)
     local scaledPreset = DeepCopyTable(preset)
+    local disabled = GetDisabledSkillSet(presetKey)
+    local disabledCount = 0
 
-    for _, phasePool in pairs(scaledPreset.skillPools or {}) do
+    -- 条目启停：被禁用的 spellId 从技能池 / 开场技能 / 连招里剔除（连招被剔空则整条丢弃）
+    for phaseKey, phasePool in pairs(scaledPreset.skillPools or {}) do
+        local kept = {}
         for _, skill in ipairs(phasePool) do
-            skill.minCD = ScaleCooldown(skill.minCD, difficulty.cooldownMultiplier)
-            skill.maxCD = math.max(skill.minCD, ScaleCooldown(skill.maxCD, difficulty.cooldownMultiplier))
+            if disabled[skill.spellId] then
+                disabledCount = disabledCount + 1
+            else
+                skill.minCD = ScaleCooldown(skill.minCD, difficulty.cooldownMultiplier)
+                skill.maxCD = math.max(skill.minCD, ScaleCooldown(skill.maxCD, difficulty.cooldownMultiplier))
+                table.insert(kept, skill)
+            end
         end
+
+        -- 整个阶段池被禁用会让该阶段无技能可用，此时忽略本轮启停设置（改配置比停摆安全）
+        if #kept == 0 and #phasePool > 0 then
+            print(" [配置]阶段 " .. tostring(phaseKey) .. " 的技能被全部禁用，本轮忽略启停设置")
+            for _, skill in ipairs(phasePool) do
+                skill.minCD = ScaleCooldown(skill.minCD, difficulty.cooldownMultiplier)
+                skill.maxCD = math.max(skill.minCD, ScaleCooldown(skill.maxCD, difficulty.cooldownMultiplier))
+                table.insert(kept, skill)
+            end
+        end
+
+        scaledPreset.skillPools[phaseKey] = kept
     end
 
+    local sourceOpenings = scaledPreset.openingSkills or {}
+    local keptOpenings = {}
+    for _, skill in ipairs(sourceOpenings) do
+        if disabled[skill.spellId] then
+            disabledCount = disabledCount + 1
+        else
+            table.insert(keptOpenings, skill)
+        end
+    end
+    if #keptOpenings == 0 and #sourceOpenings > 0 then
+        keptOpenings = sourceOpenings
+    end
+    scaledPreset.openingSkills = keptOpenings
+
+    local chancePct = ClampNumber(tonumber(BOSS_CONFIG.comboTriggerChancePct) or 100, 0, 300)
+    local keptCombos = {}
     for _, combo in ipairs(scaledPreset.comboChains or {}) do
-        combo.cooldown = ScaleCooldown(combo.cooldown, difficulty.comboCooldownMultiplier)
-        combo.triggerChance = ClampNumber((combo.triggerChance or 30) + difficulty.comboChanceOffset, 10, 80)
+        local keptSkills = {}
+        for _, skillInfo in ipairs(combo.skills or {}) do
+            if disabled[skillInfo[1]] then
+                disabledCount = disabledCount + 1
+            else
+                table.insert(keptSkills, skillInfo)
+            end
+        end
+
+        if #keptSkills > 0 then
+            combo.skills = keptSkills
+            combo.cooldown = ScaleCooldown(combo.cooldown, difficulty.comboCooldownMultiplier)
+            combo.triggerChance = ClampNumber(
+                ((combo.triggerChance or 30) + difficulty.comboChanceOffset) * chancePct / 100, 5, 95)
+            table.insert(keptCombos, combo)
+        end
+    end
+    scaledPreset.comboChains = keptCombos
+
+    if disabledCount > 0 then
+        print(" [配置]条目启停: 预设 " .. tostring(presetKey) .. " 本轮剔除 " .. disabledCount .. " 处条目")
     end
 
     return scaledPreset
@@ -2373,7 +2691,7 @@ local function ApplySkillConfig(presetKey, difficultyKey)
         error("技能池预设或强度档位无效")
     end
 
-    local scaledPreset = BuildScaledPreset(preset, difficulty)
+    local scaledPreset = BuildScaledPreset(preset, difficulty, resolvedPresetKey)
 
     ACTIVE_SKILL_PRESET_KEY = resolvedPresetKey
     ACTIVE_SKILL_PRESET = preset
@@ -4477,8 +4795,8 @@ function TargetSelector:FindCastingPlayers(creature, cachedThreatList)
                     if isCasting then
                         -- 计算施法威胁评分
                         local score = self:GetThreatScore(unit, creature)
-                        -- 额外增加施法中的优先级（确保打断优先级）
-                        score = score + 100
+                        -- 额外增加施法中的优先级（确保打断优先级，权重键 interrupt）
+                        score = score + GetScoreWeight("interrupt")
                         table.insert(castingPlayers, {
                             unit = unit, 
                             score = score, 
@@ -4496,45 +4814,107 @@ function TargetSelector:FindCastingPlayers(creature, cachedThreatList)
     return castingPlayers
 end
 
--- 获取目标威胁评分
-function TargetSelector:GetThreatScore(unit, creature)
+-- 威胁上下文：候选集里的最高威胁值，用于把仇恨折算成 0..threat 权重的加分
+BuildThreatContext = function(creature, threatList)
+    local context = {maxThreat = 0, threatByGuid = {}}
+    if BOSS_CONFIG.threatFactorEnabled ~= true then
+        return context
+    end
+
+    for _, unit in ipairs(threatList or {}) do
+        if IsUnitValid(unit) then
+            local success, threat = pcall(function() return creature:GetThreat(unit) end)
+            local threatValue = success and tonumber(threat) or nil
+            if threatValue and threatValue > 0 then
+                local guid = SafeGetGuidLow(unit)
+                if guid then
+                    context.threatByGuid[guid] = threatValue
+                    if threatValue > context.maxThreat then
+                        context.maxThreat = threatValue
+                    end
+                end
+            end
+        end
+    end
+
+    return context
+end
+
+--  终选随机窗口：评分不低于「最高分 × (1 - spreadPct%)」的候选等概率随机；spreadPct = 0 时只取最高分。
+--  替代原先"无条件在前 3 名里乱抽"：分差大时目标由仇恨/职业/血量决定，分差小才体现随机性。
+PickCandidateWithinSpread = function(sortedCandidates, spreadPct)
+    if not sortedCandidates or #sortedCandidates == 0 then
+        return nil
+    end
+
+    local bestScore = sortedCandidates[1].score or 0
+    local spread = ClampNumber(tonumber(spreadPct) or 0, 0, 100)
+    local threshold = bestScore - math.abs(bestScore) * spread / 100
+
+    local window = {}
+    for _, candidate in ipairs(sortedCandidates) do
+        if (candidate.score or 0) >= threshold then
+            table.insert(window, candidate)
+        else
+            break
+        end
+    end
+
+    if #window == 0 then
+        window[1] = sortedCandidates[1]
+    end
+
+    return window[math.random(#window)]
+end
+
+-- 获取目标威胁评分（各项权重可配：[feel_target].target_score_weights_text）
+function TargetSelector:GetThreatScore(unit, creature, threatContext)
     if not IsUnitValid(unit) or not IsUnitValid(creature) then return 0 end
     
-    local score = 50  -- 基础分
+    local score = GetScoreWeight("base")  -- 基础分
     
     -- 距离因素（越近威胁越高）
     local success, dist = pcall(function() return creature:GetDistance(unit) end)
     if success and dist then
-        if dist < 5 then
-            score = score + 30
-        elseif dist > 20 then
-            score = score - 20
+        if dist < GetScoreWeight("dist_near_range") then
+            score = score + GetScoreWeight("dist_near")
+        elseif dist > GetScoreWeight("dist_far_range") then
+            score = score - GetScoreWeight("dist_far")
         end
     end
     
     -- 职业类型优先级
     local classType = self:GetClassType(unit)
     if classType == "healer" then
-        score = score + 40  -- 优先攻击治疗
+        score = score + GetScoreWeight("class_healer")  -- 优先攻击治疗
     elseif classType == "ranged" then
-        score = score + 20  -- 其次攻击远程
+        score = score + GetScoreWeight("class_ranged")  -- 其次攻击远程
     elseif classType == "melee" then
-        score = score + 10
+        score = score + GetScoreWeight("class_melee")
     end
     
     -- 血量因素（优先攻击低血量）
     local success, hpPct = pcall(function() return unit:GetHealthPct() end)
     if success and hpPct then
-        if hpPct < 30 then
-            score = score + 25  -- 斩杀线
-        elseif hpPct < 50 then
-            score = score + 15
+        if hpPct < GetScoreWeight("hp_low_threshold") then
+            score = score + GetScoreWeight("hp_low")  -- 斩杀线
+        elseif hpPct < GetScoreWeight("hp_mid_threshold") then
+            score = score + GetScoreWeight("hp_mid")
         end
     end
     
-    -- 是否正在施法（优先打断）- 基础评分增加
+    -- 是否正在施法（优先打断）
     if self:IsCasting(unit) then
-        score = score + 50  -- 大幅提升施法目标的优先级
+        score = score + GetScoreWeight("casting")
+    end
+    
+    -- 仇恨因子：按占最高威胁的比例折算，坦克拉住的目标不再被随机换掉
+    if threatContext and threatContext.maxThreat > 0 then
+        local guid = SafeGetGuidLow(unit)
+        local threatValue = guid and threatContext.threatByGuid[guid] or 0
+        if threatValue and threatValue > 0 then
+            score = score + GetScoreWeight("threat") * (threatValue / threatContext.maxThreat)
+        end
     end
     
     return score
@@ -4557,19 +4937,20 @@ function TargetSelector:SelectSmartTarget(creature, options, cachedThreatList)
     end
     
     local candidates = {}
+    local threatContext = BuildThreatContext(creature, threatList)
     for _, unit in ipairs(threatList) do
         if IsUnitValid(unit) then
             local success, isPlayer = pcall(function() return unit:IsPlayer() end)
             if success and isPlayer then
                 local dist = creature:GetDistance(unit)
                 if dist <= maxDistance then
-                    local score = self:GetThreatScore(unit, creature)
+                    local score = self:GetThreatScore(unit, creature, threatContext)
                     
                     -- 根据偏好类型调整分数
                     if preferType then
                         local classType = self:GetClassType(unit)
                         if classType == preferType then
-                            score = score + 50
+                            score = score + GetScoreWeight("prefer_type")
                         end
                     end
                     
@@ -4587,9 +4968,8 @@ function TargetSelector:SelectSmartTarget(creature, options, cachedThreatList)
     -- 按分数排序
     table.sort(candidates, function(a, b) return a.score > b.score end)
     
-    -- 前3名中随机选择（增加不确定性）
-    local topCount = math.min(3, #candidates)
-    local selected = candidates[math.random(topCount)]
+    -- 分差窗口内随机（[feel_target].target_random_spread_pct）
+    local selected = PickCandidateWithinSpread(candidates, BOSS_CONFIG.targetRandomSpreadPct)
     
     print(" [AI]智能目标选择: " .. SafeGetUnitName(selected.unit) .. 
           " 评分:" .. string.format("%.0f", selected.score) .. 
@@ -4609,9 +4989,11 @@ function SkillAI:CheckCondition(condition, creature, target)
     local threatList = BuildSafeThreatList(creature)
     local enemyCount = threatList and #threatList or 0
     local hpPct = creature:GetHealthPct()
+    local meleeRange = GetConditionThreshold("multi_melee_range")
+    local groupedRange = GetConditionThreshold("grouped_range")
     
     if condition == "multi_target" then
-        return enemyCount >= 1
+        return enemyCount >= GetConditionThreshold("multi_target")
     elseif condition == "multi_melee" then
         -- 检查近身敌人数量
         local meleeCount = 0
@@ -4619,17 +5001,17 @@ function SkillAI:CheckCondition(condition, creature, target)
             for _, unit in ipairs(threatList) do
                 if IsUnitValid(unit) then
                     local dist = creature:GetDistance(unit)
-                    if dist and dist < 8 then
+                    if dist and dist < meleeRange then
                         meleeCount = meleeCount + 1
                     end
                 end
             end
         end
-        return meleeCount >= 1
+        return meleeCount >= GetConditionThreshold("multi_melee")
     elseif condition == "low_hp" then
-        return hpPct < 50
+        return hpPct < GetConditionThreshold("low_hp")
     elseif condition == "critical_hp" then
-        return hpPct < 20
+        return hpPct < GetConditionThreshold("critical_hp")
     elseif condition == "ranged_target" and IsUnitValid(target) then
         -- 远程或治疗职业
         local classType = TargetSelector:GetClassType(target)
@@ -4647,18 +5029,18 @@ function SkillAI:CheckCondition(condition, creature, target)
         -- 检查目标是否有可驱散的重要BUFF（简化处理）
         return true
     elseif condition == "surrounded" then
-        return enemyCount >= 3
+        return enemyCount >= GetConditionThreshold("surrounded")
     elseif condition == "many_attackers" then
-        return enemyCount >= 4
+        return enemyCount >= GetConditionThreshold("many_attackers")
     elseif condition == "distant_target" and IsUnitValid(target) then
         local dist = creature:GetDistance(target)
-        return dist and dist > 12
+        return dist and dist > GetConditionThreshold("distant_target")
     elseif condition == "low_hp_target" and IsUnitValid(target) then
         -- 目标血量低，适合斩杀
         local success, targetHp = pcall(function() return target:GetHealthPct() end)
-        return success and targetHp and targetHp < 25
+        return success and targetHp and targetHp < GetConditionThreshold("low_hp_target")
     elseif condition == "grouped_targets" then
-        -- 检查玩家是否过于集中（8码内有其他玩家）
+        -- 检查玩家是否过于集中（grouped_range 码内有其他玩家）
         if not threatList then return false end
         local groupedCount = 0
         for i, unit1 in ipairs(threatList) do
@@ -4668,21 +5050,24 @@ function SkillAI:CheckCondition(condition, creature, target)
                 for j, unit2 in ipairs(threatList) do
                     if i ~= j and IsUnitValid(unit2) then
                         local dist = unit1:GetDistance(unit2)
-                        if dist and dist < 8 then
+                        if dist and dist < groupedRange then
                             groupedCount = groupedCount + 1
                         end
                     end
                 end
             end
         end
-        return groupedCount >= 2
+        return groupedCount >= GetConditionThreshold("grouped_targets")
     elseif condition == "kiting_target" and IsUnitValid(target) then
         -- 正在风筝（距离远且是远程职业）
         local classType = TargetSelector:GetClassType(target)
         local dist = creature:GetDistance(target)
-        return (classType == "ranged" or classType == "healer") and dist and dist > 8
+        return (classType == "ranged" or classType == "healer")
+            and dist and dist > GetConditionThreshold("kiting_target_range")
     end
     
+    -- 未登记的条件名一律放行（保持既有行为），但记一条日志，拼错时能看见
+    print(" [条件]未登记的条件名，按无条件处理: " .. tostring(condition))
     return true
 end
 
@@ -4727,8 +5112,9 @@ function SkillAI:SelectBestSkill(phase, creature, target)
     -- 按优先级排序
     table.sort(validSkills, function(a, b) return a.priority > b.priority end)
     
-    -- 前2个中随机选择
-    local topCount = math.min(2, #validSkills)
+    -- 优先级最高的前 N 条里随机（[feel_skill].skill_pick_random_top，1 = 总是最高优先级）
+    local randomTop = math.max(1, math.floor(tonumber(BOSS_CONFIG.skillPickRandomTop) or 2))
+    local topCount = math.min(randomTop, #validSkills)
     return validSkills[math.random(topCount)]
 end
 
@@ -4768,12 +5154,9 @@ function SkillAI:TryInterruptCast(creature, target, state)
     return false
 end
 
--- 施放技能的辅助函数，统一处理技能施放和喊话
--- 施法方式开关（2026-09）：false = 副本式读条（有前摇、可被打断）；true = 触发式瞬发（旧行为，无前摇）。
--- 想回到旧手感把下面这行改成 true 即可；只影响 SkillAI:CastSkill 发出的技能，
--- 打断法术池（INTERRUPT_SPELL_LIBRARY）保持触发式瞬发，保证打断一定会落地。
-local SKILL_CAST_TRIGGERED = false
-
+-- 施放技能的辅助函数，统一处理技能施放和喊话。
+-- 施法方式由 [feel_skill].skill_instant_cast 决定：false = 副本式读条（有前摇、可被打断）；true = 触发式瞬发。
+-- 只影响本函数发出的技能，打断法术池（INTERRUPT_SPELL_LIBRARY）保持触发式瞬发，保证打断一定会落地。
 function SkillAI:CastSkill(creature, target, skill, state)
     if not skill or not IsUnitValid(creature) then return false end
 
@@ -4789,8 +5172,9 @@ function SkillAI:CastSkill(creature, target, skill, state)
         end
     end
 
+    local instantCast = BOSS_CONFIG.skillInstantCast == true
     local castOk, castResult = pcall(function()
-        return creature:CastSpell(castTarget, skill.spellId, SKILL_CAST_TRIGGERED)
+        return creature:CastSpell(castTarget, skill.spellId, instantCast)
     end)
 
     -- 读条模式下核心会返回 false（被沉默 / 正在施法 / 目标非法等）；桩环境没有返回值（nil）按成功处理
@@ -4807,6 +5191,61 @@ function SkillAI:CastSkill(creature, target, skill, state)
     end
     
     return true
+end
+
+--  点名预警（[marker] 组）：单体点名技能（target = "victim"）出手前先给目标挂标记光环并喊话，
+--  延迟到点后再真正施放。返回 true = 已进入预警等待，调用方本次不要再施放技能。
+--  预警法术为 0 时只喊话；功能关闭或延迟为 0 时返回 false（调用方按未预警处理，立即施放）。
+function SkillAI:TryMarkerWarning(creature, target, skill, state, cooldownField)
+    if BOSS_CONFIG.markerWarningEnabled ~= true then return false end
+    if not skill or skill.target ~= "victim" or not IsUnitValid(target) then return false end
+    if state.pendingWarn then return true end
+
+    local delaySec = ClampNumber(tonumber(BOSS_CONFIG.markerWarningDelaySec) or 0, 0, 10)
+    if delaySec <= 0 then return false end
+
+    local successPlayer, isPlayer = pcall(function() return target:IsPlayer() end)
+    if not successPlayer or not isPlayer then return false end
+
+    local targetName = SafeGetUnitName(target)
+    local markerSpellId = tonumber(BOSS_CONFIG.markerWarningSpellId) or 0
+    if markerSpellId > 0 then
+        pcall(function() creature:CastSpell(target, markerSpellId, true) end)
+    end
+
+    TauntSystem:SendRandomTaunt(creature, BOSS_CONFIG.combatTaunts.markerWarningYells, {
+        ["{PLAYER_NAME}"] = targetName,
+    })
+
+    state.pendingWarn = {
+        unit = target,
+        skill = skill,
+        cooldownField = cooldownField,
+        readyAt = (state.combatTime or 0) + delaySec * 1000,
+        name = skill.name or tostring(skill.spellId),
+    }
+
+    print(string.format(" [AI]点名预警: %s 锁定 %s，%.0f 秒后出手",
+        state.pendingWarn.name, targetName, delaySec))
+    return true
+end
+
+-- 预警到点：真正施放被预警的技能（目标已失效则丢弃这次预警）
+function SkillAI:ResolvePendingWarning(creature, state)
+    local warn = state.pendingWarn
+    if not warn then return end
+    if (state.combatTime or 0) < (warn.readyAt or 0) then return end
+
+    state.pendingWarn = nil
+    if not IsUnitValid(warn.unit) then
+        print(" [AI]点名预警目标已失效，取消本次施放: " .. tostring(warn.name))
+        return
+    end
+
+    if self:CastSkill(creature, warn.unit, warn.skill, state) and warn.cooldownField then
+        local skill = warn.skill
+        state[warn.cooldownField] = math.random(skill.minCD, skill.maxCD)
+    end
 end
 
 -- 检查是否可以执行连招
@@ -4856,7 +5295,8 @@ function SkillAI:TryComboChain(creature, state, currentPhase)
     -- 检查触发概率
     if math.random(100) <= triggerChance then
         state.comboCooldowns[combo.name] = combo.cooldown
-        state.comboCooldown = 5  -- 全局连招冷却，防止连续连招
+        -- 全局连招冷却，防止连续连招（[feel_skill].combo_global_cooldown_seconds）
+        state.comboCooldown = tonumber(BOSS_CONFIG.comboGlobalCooldownSeconds) or 5
         return combo
     end
     
@@ -5015,8 +5455,9 @@ local function SelectSmartMinionTarget(minion, preferredGuid)
     end
 
     table.sort(candidates, function(a, b) return a.score > b.score end)
-    local topCount = math.min(3, #candidates)
-    return candidates[math.random(topCount)].unit
+    -- 与 Boss 同一套终选窗口（[feel_target].target_random_spread_pct）
+    local selected = PickCandidateWithinSpread(candidates, BOSS_CONFIG.targetRandomSpreadPct)
+    return selected and selected.unit or nil
 end
 
 local function SmartMinionAI(event, delay, calls, minion)
@@ -5109,6 +5550,110 @@ local function SummonMinions(creature, count, targetGuid)
 end
 
 -- ========== 智能Boss AI ==========
+--  软狂暴（[enrage] 组）：战斗时长超过 soft_enrage_seconds 后，每 soft_enrage_interval_seconds 叠一层 ——
+--  施放强化法术 + 按层数提升移动速度 + 喊话 + 落一条事件；层数上限 soft_enrage_max_stacks。
+UpdateSoftEnrage = function(creature, state)
+    if BOSS_CONFIG.softEnrageEnabled ~= true then return end
+
+    local startMs = (tonumber(BOSS_CONFIG.softEnrageSeconds) or 300) * 1000
+    local combatTime = state.combatTime or 0
+    if combatTime < startMs then return end
+
+    local maxStacks = math.max(1, math.floor(tonumber(BOSS_CONFIG.softEnrageMaxStacks) or 10))
+    local intervalMs = math.max(5, tonumber(BOSS_CONFIG.softEnrageIntervalSec) or 30) * 1000
+    state.softEnrageStacks = state.softEnrageStacks or 0
+    state.softEnrageNextAt = state.softEnrageNextAt or startMs
+
+    if state.softEnrageStacks >= maxStacks then return end
+    if combatTime < state.softEnrageNextAt then return end
+
+    state.softEnrageStacks = state.softEnrageStacks + 1
+    state.softEnrageNextAt = state.softEnrageNextAt + intervalMs
+
+    local stacks = state.softEnrageStacks
+    local spellId = tonumber(BOSS_CONFIG.softEnrageSpellId) or 0
+    if spellId > 0 then
+        pcall(function() creature:CastSpell(creature, spellId, true) end)
+    end
+
+    local speedPct = tonumber(BOSS_CONFIG.softEnrageSpeedPct) or 0
+    if speedPct > 0 then
+        -- 基准速率取第一次叠层时的现值，之后按层数线性放大（不逐层连乘，避免指数膨胀）
+        if not state.baseRunSpeedRate then
+            local success, rate = pcall(function() return creature:GetSpeedRate(1) end)
+            state.baseRunSpeedRate = (success and tonumber(rate)) or 1
+        end
+        pcall(function()
+            creature:SetSpeed(1, state.baseRunSpeedRate * (1 + speedPct * stacks / 100), true)
+        end)
+    end
+
+    local yells = BOSS_CONFIG.combatTaunts.softEnrageYells or {}
+    local yellIndex = math.min(stacks, #yells)
+    if yellIndex > 0 then
+        creature:SendUnitYell(yells[yellIndex], 0)
+    end
+
+    print(string.format(" [AI]软狂暴第 %d 层（战斗 %.0f 秒，移速 +%d%%）",
+        stacks, combatTime / 1000, speedPct * stacks))
+    InsertBossEvent(creature, "soft_enrage", "软狂暴层数 " .. tostring(stacks) .. "。", "", 0, {
+        stacks = stacks,
+        combat_time_seconds = math.floor(combatTime / 1000),
+        speed_pct = speedPct * stacks,
+    })
+end
+
+--  团灭判定（[wipe] 组）：威胁表里连续 wipe_grace_seconds 秒没有任何存活单位即判团灭 ——
+--  停手 + 清仇恨 + 回血 + 喊话。返回 true = 本次 tick 到此结束。
+CheckBossWipe = function(creature, state, threatList, delay)
+    if BOSS_CONFIG.wipeDetectEnabled ~= true then
+        state.wipeElapsedMs = 0
+        return false
+    end
+
+    local livingCount = 0
+    for _, unit in ipairs(threatList or {}) do
+        if IsUnitValid(unit) then
+            local success, alive = pcall(function() return unit:IsAlive() end)
+            if not success or alive then
+                livingCount = livingCount + 1
+            end
+        end
+    end
+
+    if livingCount > 0 then
+        state.wipeElapsedMs = 0
+        return false
+    end
+
+    state.wipeElapsedMs = (state.wipeElapsedMs or 0) + delay
+    local graceMs = math.max(3, tonumber(BOSS_CONFIG.wipeGraceSec) or 12) * 1000
+    if state.wipeElapsedMs < graceMs then return false end
+
+    state.wipeElapsedMs = 0
+    state.pendingWarn = nil
+    state.softEnrageStacks = 0
+    state.softEnrageNextAt = nil
+
+    local successMax, maxHealth = pcall(function() return creature:GetMaxHealth() end)
+    local resetPct = ClampNumber(tonumber(BOSS_CONFIG.wipeResetHealthPct) or 100, 1, 100)
+    if successMax and maxHealth then
+        pcall(function() creature:SetHealth(math.max(1, math.floor(maxHealth * resetPct / 100))) end)
+    end
+
+    pcall(function() creature:AttackStop() end)
+    pcall(function() creature:ClearThreatList() end)
+
+    TauntSystem:SendRandomTaunt(creature, BOSS_CONFIG.combatTaunts.wipeYells)
+    print(string.format(" [AI]团灭判定：威胁表全灭 %.0f 秒，Boss 停手并回血到 %d%%", graceMs / 1000, resetPct))
+    InsertBossEvent(creature, "wipe", "威胁表全灭，Boss 停手回血。", "", 0, {
+        grace_seconds = math.floor(graceMs / 1000),
+        reset_health_pct = resetPct,
+    })
+
+    return true
+end
+
 local function SmartBossAI(event, delay, calls, creature)
     if not creature or not creature:IsAlive() then return end
     local guid = creature:GetGUIDLow()
@@ -5140,6 +5685,13 @@ local function SmartBossAI(event, delay, calls, creature)
     
     -- 更新战斗时间
     state.combatTime = (state.combatTime or 0) + delay
+
+    -- 软狂暴（[enrage] 组）：按战斗时长叠加强化层
+    UpdateSoftEnrage(creature, state)
+
+    -- 点名预警到点则出手；预警等待期间不做其它决策（保持"先警示、后出手"的可读节奏）
+    SkillAI:ResolvePendingWarning(creature, state)
+    if state.pendingWarn then return end
     
     -- 获取并缓存威胁列表
     local currentThreatList = BuildSafeThreatList(creature)
@@ -5162,6 +5714,9 @@ local function SmartBossAI(event, delay, calls, creature)
         bossThreatSnapshots[guid] = enhancedSnapshot
     end
     TrackEncounterPresence(creature, currentThreatList)
+
+    -- 团灭判定（[wipe] 组）：威胁表全灭并持续 grace 秒 → 停手 + 回血 + 喊话
+    if CheckBossWipe(creature, state, currentThreatList, delay) then return end
 
     -- 血量采样（跨重启折算的依据）：按 [recovery].health_sample_interval_sec 节流写库
     SampleBossHealth(creature)
@@ -5189,6 +5744,12 @@ local function SmartBossAI(event, delay, calls, creature)
             from_phase = prevPhase,
             to_phase = state.phase,
             health_pct = hp,
+        })
+        -- 阶段世界公告（[announce] 组，可关）
+        BossAnnounce("phase", {
+            BOSS_NAME = GetBossDisplayName(creature),
+            PHASE = state.phase,
+            HEALTH_PCT = string.format("%.0f", hp),
         })
         -- 阶段切换触发特效（法术ID与数量都可配：[phase] 组）
         if state.phase == 2 and not state.phase2Triggered then
@@ -5336,8 +5897,8 @@ local function SmartBossAI(event, delay, calls, creature)
         end
     end
     
-    -- 战术移动检查
-    if TacticalAI:ShouldChase(creature, target) then
+    -- 战术移动检查：正在读条时不移动（移动指令会打断自己的施法）
+    if not TargetSelector:IsCasting(creature) and TacticalAI:ShouldChase(creature, target) then
         TacticalAI:ExecuteMove(creature, target)
     end
     
@@ -5401,10 +5962,15 @@ local function SmartBossAI(event, delay, calls, creature)
         if not skillUsed and state.phase >= cfg.phase and state[cfg.cdField] <= 0 then
             local skill = SkillAI:SelectBestSkill(cfg.phase, creature, target)
             if skill then
-                print(" [AI]施放" .. cfg.name .. "技能: " .. skill.name)
-                if SkillAI:CastSkill(creature, target, skill, state) then
-                    state[cfg.cdField] = math.random(skill.minCD, skill.maxCD)
+                -- 单体点名技能先预警（挂标记 + 喊话 + 延迟）；预警成功时本次不再出手
+                if SkillAI:TryMarkerWarning(creature, target, skill, state, cfg.cdField) then
                     skillUsed = true
+                else
+                    print(" [AI]施放" .. cfg.name .. "技能: " .. skill.name)
+                    if SkillAI:CastSkill(creature, target, skill, state) then
+                        state[cfg.cdField] = math.random(skill.minCD, skill.maxCD)
+                        skillUsed = true
+                    end
                 end
             end
         end
@@ -5712,6 +6278,8 @@ local function SpawnRandomBoss(instanceId, force)
         })
         local respawnYellText = string.gsub(BOSS_CONFIG.bossRespawnYell, "{BOSS_NAME}", bossName)
         boss:SendUnitYell(respawnYellText, 0)
+        -- 生成世界公告（[announce] 组，可关）
+        BossAnnounce("spawn", {BOSS_NAME = bossName, MAP_ID = spawnPoint.mapId})
         local spawnTime = BossNow()
         PersistBossRuntime(boss, {
             status = "spawned",
@@ -5896,6 +6464,9 @@ local function SpawnBossFromRuntime()
         recoveredYell = string.gsub(recoveredYell, "{HEALTH_PCT}", tostring(healthPct))
         boss:SendUnitYell(recoveredYell, 0)
     end
+
+    -- 恢复世界公告（[announce] 组，可关）
+    BossAnnounce("restore", {BOSS_NAME = bossName, HEALTH_PCT = healthPct, MAP_ID = mapId})
 
     print(string.format(" [恢复]已重建 Boss（GUID %d，entry=%d，刷新点 #%d，血量 %d%%，预设 %s）。",
         boss:GetGUIDLow(), entry, spawnPointIndex, healthPct, tostring(presetKey)))

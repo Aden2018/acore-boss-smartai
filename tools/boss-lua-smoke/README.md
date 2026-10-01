@@ -32,16 +32,16 @@ cd <acore-boss-smartai>\tools\boss-lua-smoke
 
 ## 覆盖范围
 
-391 条断言，按 19 段（下表按主题归并）执行；`.boss config show` 报出的**配置**分组是 20 组。
+575 条断言（输出里的 `[ ok ]` 行数，下表按主题归并执行）；`.boss config show` 报出的**配置**分组是 26 组。
 
 | 断言组 | 内容 |
 |---|---|
 | 加载 | `EnsureBossSchema` / `LoadBossConfigFromDB` / `LoadBossRuntimeFromDB` / 事件注册全流程无运行期错误；加载期日志可被捕获 |
 | 回归 | 全局 `print` 未被覆盖；`RegisterBossEventsFor*`、`activeBossInfo`、`IsManagedBossEntry` 不泄漏为全局（其它导出全局允许） |
 | SQL | 主表与扩展表（`boss_activity_config_ext`）的引导写入；扩展表写入列数 = 描述表项数 + `state_key` + `updated_at`；配置表不再用 `REPLACE INTO`；启动时写入 runtime 引导行 |
-| 表结构自举 | 老库缺列时按描述表逐列 `ALTER ... ADD COLUMN ... AFTER`（[phase] 12 + [schedule] 3 + [recovery]/[reward] 5 + 运行态 3），补列必须发生在引导写入之前 |
+| 表结构自举 | 老库缺列时按描述表逐列 `ALTER ... ADD COLUMN ... AFTER`（[phase] 12 + [schedule] 3 + [recovery]/[reward] 5 + 批 5 手感 28 + 运行态 3），补列必须发生在引导写入之前 |
 | 列契约 | `information_schema` 的"存在的列名"逐行读法；运行态 / 奖池整行 SELECT 的**列顺序**与快照一致（错位会静默读成隔壁字段）；奖池 SELECT 的 state_key / `deleted_at = 0` / `ORDER BY sort_order, pool_id` |
-| 配置 | 20 组分齐全、项数之和 = 描述表总数；喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板/技能池随机/**恢复**/**结算口径**/定时启停**确实取自数据库**（桩数据用与默认值不同的值）；数据库快照缺列会直接判失败 |
+| 配置 | 26 组分齐全、项数之和 = 描述表总数；喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板/技能池随机/**恢复**/**结算口径**/定时启停/**技能手感 / 目标选择 / 软狂暴 / 团灭判定 / 世界公告 / 点名预警**确实取自数据库（桩数据用与默认值不同的值）；数据库快照缺列会直接判失败 |
 | 命令 | `help` / `pools` / `config reload` / `config show [分组]` / `preset list` / `preset <key>` / `preset random on\|off` / `preset pool <key,key>\|all` / `difficulty <key>` / `rebase` / `kill` / `clear` / `schedule` / `spawn` / `spawn force` / 未知子命令 的标记与语义 |
 | 技能池随机 | 开启后连续 20 次生成**每次都落在池内**且会出现不同预设；关闭后固定用 GM 指定的那套；`preset random off` / `preset pool` 写回扩展表且 `.boss config show` 立即反映；非法 key 返回 `AGMP_ERROR` |
 | 技能池 / 连招内容 | 按**变量名**从已注册回调的闭包链取 `SKILL_PRESET_LIBRARY` / `SKILL_DIFFICULTY_LIBRARY` / `ApplySkillPreset` / `ApplySkillDifficulty`（`debug.getupvalue`，没有命令能打印它们），对**全部**预设断言：连招里每个法术 ID 都在同一预设的池内、`phase` 非空且 ⊆`{1,2,3}` 并有法术落在其声明阶段的池里、1/2/3 三段都被覆盖、池与 `openingSkills` 条目自检、连招名跨预设全局唯一、每个预设至少 `MIN_COMBOS_PER_PRESET` 条；连招喊话对**文件内默认库**硬断言（另加载一份 `CharDBQuery→nil` 的副本）；4 档难度 × 全部预设走真实缩放函数后**现取**结果，断言冷却与概率落在设计区间且未被钳制 |
@@ -58,6 +58,7 @@ cd <acore-boss-smartai>\tools\boss-lua-smoke
 | 写库失败可见性 | `CharDBExecute` 抛错一次 → `BossSql.failures.count` +1、打印 `[配置]写库失败[...]`、`.boss config reload` 仍返回 `AGMP_OK` 且回执里带上失败次数；"语句执行成功但回读不到"同样计入失败；`.boss help` 报告失败状态 |
 | 放行 / 副作用 / 事件 | 非 boss 命令返回 `true` 且不产生回复；`.boss clear` 写 `command_clear` 并复位 runtime；`PLAYER_EVENT_ON_HEAL(42/65)` 与受管 entry（含 ext 额外指定的档位）的 6 个 creature 事件全部注册 |
 | 多区绑定 | 把 §2 的两个 key 改写后重新加载：事件写入、runtime 语句与**奖池查询**都必须带新的 key，启动日志报出新 key，共用库名不变，老库自动补 `state_key` 列与索引；任何一处写死 `'current'` 都会失败（默认 key 与被改写 key 两种跑法都必须 PASS） |
+| 批 5 手感与机制 | 键值配置（`skill_condition_thresholds_text` / `target_score_weights_text` / `announce_texts_text`）逐键读取、没写到的键回退脚本默认；条件阈值与评分权重真的参与判定（阈值 5 时 4 个敌人不成立、5 个成立）；威胁因子开关前后评分变化；终选分差窗口（0 = 只取最高分、25% 窗口内两者都可能、分差 100 vs 50 时只取最高）；软狂暴按起算时间叠层、施放强化法术、移速 = 基准 × (1 + 每层% × 层数)、喊话取自库、层数不超上限；团灭判定（宽限期内不停手、到点后 `AttackStop` + `ClearThreatList` + 回血到库值 + 喊话、表里还有存活单位则计时清零）；点名预警（挂标记光环 + 喊话 + 暂不出手、延迟到点才施放原技能、出手后记账与清状态、非 victim 与关闭开关时不预警）；`skill_instant_cast` 决定 `CastSpell` 的触发式参数；条目启停把被禁用的 spellId 从技能池 / 开场技能 / 连招三处剔除且清空后恢复原样；主循环接入（软狂暴 / 团灭 / 预警结算 / 读条移动门控）与三处世界公告调用点做源码结构回归 |
 
 ## 已知缺口（离线测不到的 / 需要 boss.lua 侧决定的）
 

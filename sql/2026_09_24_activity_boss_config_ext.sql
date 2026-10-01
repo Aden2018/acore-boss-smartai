@@ -80,10 +80,45 @@ CREATE TABLE IF NOT EXISTS `ac_eluna`.`boss_activity_config_ext` (
   -- [reward] 结算口径（奖池本体在 boss_reward_pools 表，不再是这里的列）
   `last_hit_only_qualifies` TINYINT NOT NULL DEFAULT 0,
   `offline_reward_delivery` TINYINT NOT NULL DEFAULT 1,
-  -- [schedule] 定时启停：每天的时间段（这三列必须留在描述表末尾，面板按列序镜像）
+  -- [schedule] 定时启停：每天的时间段（列序与 boss.lua 描述表、面板 ext_fields 完全一致）
   `activity_schedule_enabled` TINYINT NOT NULL DEFAULT 0,
   `activity_schedule_windows` VARCHAR(255) NOT NULL DEFAULT '',
   `activity_schedule_clear_on_close` TINYINT NOT NULL DEFAULT 1,
+  -- [feel_skill] 技能手感：读条/瞬发、连招触发率系数与全局冷却、技能选取窗口、条件阈值、条目启停
+  `skill_instant_cast` TINYINT NOT NULL DEFAULT 0,
+  `combo_trigger_chance_pct` INT NOT NULL DEFAULT 100,
+  `combo_global_cooldown_seconds` INT NOT NULL DEFAULT 5,
+  `skill_pick_random_top` INT NOT NULL DEFAULT 2,
+  `skill_condition_thresholds_text` TEXT NULL,
+  `skill_disabled_spells_text` TEXT NULL,
+  -- [feel_target] 目标选择：终选随机窗口、威胁因子、评分权重
+  `target_random_spread_pct` INT NOT NULL DEFAULT 25,
+  `threat_factor_enabled` TINYINT NOT NULL DEFAULT 1,
+  `target_score_weights_text` TEXT NULL,
+  -- [enrage] 软狂暴
+  `soft_enrage_enabled` TINYINT NOT NULL DEFAULT 0,
+  `soft_enrage_seconds` INT NOT NULL DEFAULT 300,
+  `soft_enrage_interval_seconds` INT NOT NULL DEFAULT 30,
+  `soft_enrage_spell_id` INT NOT NULL DEFAULT 8599,
+  `soft_enrage_speed_pct_per_stack` INT NOT NULL DEFAULT 5,
+  `soft_enrage_max_stacks` INT NOT NULL DEFAULT 10,
+  -- [wipe] 团灭判定
+  `wipe_detect_enabled` TINYINT NOT NULL DEFAULT 1,
+  `wipe_grace_seconds` INT NOT NULL DEFAULT 12,
+  `wipe_reset_health_pct` INT NOT NULL DEFAULT 100,
+  -- [announce] 世界公告（生成 / 阶段 / 恢复）
+  `announce_spawn_enabled` TINYINT NOT NULL DEFAULT 1,
+  `announce_phase_enabled` TINYINT NOT NULL DEFAULT 1,
+  `announce_restore_enabled` TINYINT NOT NULL DEFAULT 1,
+  `announce_texts_text` TEXT NULL,
+  -- [marker] 点名预警
+  `marker_warning_enabled` TINYINT NOT NULL DEFAULT 1,
+  `marker_warning_delay_seconds` INT NOT NULL DEFAULT 2,
+  `marker_warning_spell_id` INT NOT NULL DEFAULT 0,
+  -- [taunts] 软狂暴 / 团灭 / 点名预警三组喊话（归 taunts 分组，物理列追加在表尾）
+  `taunt_soft_enrage_yells_text` TEXT NULL,
+  `taunt_wipe_yells_text` TEXT NULL,
+  `taunt_marker_warning_yells_text` TEXT NULL,
   `updated_at` INT NOT NULL DEFAULT 0,
   PRIMARY KEY (`state_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

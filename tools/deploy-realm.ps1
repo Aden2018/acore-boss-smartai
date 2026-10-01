@@ -9,7 +9,7 @@
 #    2. 写入前自动备份（boss.lua.<时间戳>.bak），写完打印源/目标 SHA256
 #    3. 可选：语法检查（-LuaExe）、**对部署件跑离线冒烟**（-SmokeScript，消除"测试件≠部署件"）、
 #       导入难度档位 SQL（-ApplyTierSql <world 库>）、导入配置类 SQL
-#       （-ApplyConfigSql <配置库>：奖池 v2 + 跨重启恢复列，带命中数断言）；
+#       （-ApplyConfigSql <配置库>：奖池 v2 + 跨重启恢复列 + 批 5 手感列，带命中数断言）；
 #       导入前会把 SQL 里写死的库名**与本区 key** 一起改写，避免动到别的区
 #    4. 打印 AGMP 面板 config/boss.php 需要同步的 server_overrides 片段
 #
@@ -275,7 +275,8 @@ if ($ApplyConfigSql -ne '') {
     $sqlRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'sql'
     $configSqls = @(
         '2026_09_30_reward_pools_v2.sql',
-        '2026_09_30_boss_recovery_columns.sql'
+        '2026_09_30_boss_recovery_columns.sql',
+        '2026_10_01_play_feel_columns.sql'
     )
 
     Write-Step "导入配置类 SQL → $ApplyConfigSql"
@@ -302,19 +303,33 @@ UNION ALL SELECT 'runtime 新列', COUNT(*) FROM information_schema.COLUMNS
     AND COLUMN_NAME IN ('health_pct','spawn_point_index','last_health_sample_at')
 UNION ALL SELECT 'ext 新列', COUNT(*) FROM information_schema.COLUMNS
   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'boss_activity_config_ext'
-    AND COLUMN_NAME IN ('health_sample_interval_sec','recovery_min_health_pct','boss_recovered_yell','last_hit_only_qualifies','offline_reward_delivery');
+    AND COLUMN_NAME IN ('health_sample_interval_sec','recovery_min_health_pct','boss_recovered_yell','last_hit_only_qualifies','offline_reward_delivery')
+UNION ALL SELECT '批 5 手感列', COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'boss_activity_config_ext'
+    AND COLUMN_NAME IN ('skill_instant_cast','combo_trigger_chance_pct','combo_global_cooldown_seconds',
+      'skill_pick_random_top','skill_condition_thresholds_text','skill_disabled_spells_text',
+      'target_random_spread_pct','threat_factor_enabled','target_score_weights_text',
+      'soft_enrage_enabled','soft_enrage_seconds','soft_enrage_interval_seconds','soft_enrage_spell_id',
+      'soft_enrage_speed_pct_per_stack','soft_enrage_max_stacks',
+      'wipe_detect_enabled','wipe_grace_seconds','wipe_reset_health_pct',
+      'announce_spawn_enabled','announce_phase_enabled','announce_restore_enabled','announce_texts_text',
+      'marker_warning_enabled','marker_warning_delay_seconds','marker_warning_spell_id',
+      'taunt_soft_enrage_yells_text','taunt_wipe_yells_text','taunt_marker_warning_yells_text');
 '@
         $assertFile = Join-Path ([System.IO.Path]::GetTempPath()) ('boss-assert-' + [guid]::NewGuid().ToString('N') + '.sql')
         try {
             [System.IO.File]::WriteAllText($assertFile, $assertSql, $utf8NoBom)
             $rows = Invoke-BossSqlFile -SqlPath $assertFile -Database $ApplyConfigSql -Label '命中数断言'
             $poolTotal = 0
+            $feelColumns = -1
             foreach ($line in $rows) {
                 $cells = ([string]$line) -split "`t"
                 if ($cells.Count -ge 2 -and $cells[0] -eq '奖池行数') { $poolTotal = [int]$cells[1] }
+                if ($cells.Count -ge 2 -and $cells[0] -eq '批 5 手感列') { $feelColumns = [int]$cells[1] }
             }
             if ($poolTotal -le 0) { throw "命中数断言失败：boss_reward_pools 里没有任何行" }
-            Write-Detail "命中数断言通过：奖池 $poolTotal 行"
+            if ($feelColumns -ne 28) { throw "命中数断言失败：扩展表批 5 手感列应为 28 列，实际 $feelColumns 列" }
+            Write-Detail "命中数断言通过：奖池 $poolTotal 行、批 5 手感列 $feelColumns 列"
         } finally {
             if (Test-Path -LiteralPath $assertFile) { Remove-Item -LiteralPath $assertFile -Force }
         }

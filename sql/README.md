@@ -15,8 +15,13 @@
 - AGMP 面板的「扩展配置」Tab 可以直接编辑这张表（二级 Tab 按分组归集），
   写入用 `INSERT ... ON DUPLICATE KEY UPDATE`（只改提交的列，不会像主表那样被 `REPLACE INTO` 重置）。
 - 查看当前生效值：`.boss config show` / `.boss config show <分组>`
-  （20 个分组：identity basic ally yells taunts ai phase patrol minion skill skill_random
-  recovery reward respawn spawnpoints schedule helper class_ai class_reward tier）。
+  （26 个分组：identity basic ally yells taunts ai phase patrol minion skill skill_random
+  respawn spawnpoints schedule helper reward recovery class_ai class_reward tier
+  feel_skill feel_target enrage wipe announce marker）。
+- 手感类参数（技能手感 / 目标选择 / 软狂暴 / 团灭判定 / 世界公告 / 点名预警）见
+  `2026_10_01_play_feel_columns.sql`：键值型配置（`skill_condition_thresholds_text` /
+  `target_score_weights_text` / `skill_disabled_spells_text` / `announce_texts_text`）
+  每行一条 `键=值`，未写到的键回退脚本内的默认值。
 - 奖池**不在这张表**：见下面的 `boss_reward_pools`。
 
 ## 活动 Boss 奖池表与跨重启恢复（2026_09_30）
@@ -26,6 +31,7 @@
 | `2026_09_30_reward_pools_v2.sql` | 建 `boss_reward_pools`（每区任意行数奖池）→ 按区补 6 个出厂池 → 把旧模型的金币区间迁到池 1 | **必须在**新版 `boss.lua` 加载前执行：旧金币列 `gold_min_copper` / `gold_max_copper` 会被脚本加载时 DROP |
 | `2026_09_30_boss_recovery_columns.sql` | 运行态 3 列（`health_pct` / `spawn_point_index` / `last_health_sample_at`）+ 贡献表 `class_id` + 扩展表 5 列（recovery 3 + reward 2） | 与上一步同批执行；两者都幂等 |
 | `2026_09_30_reward_pools_ext_cleanup.sql` | 删掉扩展表里 36 个废弃的 `reward_pool_N_*` 列（只对跑过上一版奖池模型的库有意义） | **在上一步之后**执行；`boss_reward_pools` 为空时脚本会报错拒绝执行 |
+| `2026_10_01_play_feel_columns.sql` | 扩展表新增 28 列（技能手感 6 / 目标选择 3 / 软狂暴 6 / 团灭 3 / 世界公告 4 / 点名预警 3 + taunts 三组喊话 3） | 与新版 `boss.lua` 同批；幂等，缺锚点列时退回追加到表尾 |
 
 奖池位号契约：`pool_id = k` ↔ 贡献位图第 `k-1` 位（`reward_pools_mask` 有符号 INT，故上限 31）；
 删除池走软删除（`deleted_at`），位号不复用。面板「奖池」页即这张表的 CRUD。

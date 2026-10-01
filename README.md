@@ -30,7 +30,7 @@ AzerothCore 3.3.5a Eluna Boss activity script with runtime persistence, hot-relo
 | `.boss clear` (alias `.boss despawn`) | Remove the active boss without rewards and reset the runtime row |
 | `.boss rebase` | Recompute base health from the template and re-apply the multiplier (**out of combat only**) |
 | `.boss config reload` | Hot reload config from `ac_eluna` (used by AGMP after saving) |
-| `.boss config show [group]` | Print the effective config (no group = list the 20 groups) |
+| `.boss config show [group]` | Print the effective config (no group = list the 26 groups) |
 | `.boss pools` | Print the live reward pools (id, name, chance, winner mode, prizes, gold range, announce) and where they came from |
 | `.boss preset list` / `.boss preset <key>` | List / switch the skill preset |
 | `.boss preset random on\|off` | Toggle "draw a random skill preset on every spawn" (same ext config as the panel) |
@@ -294,6 +294,31 @@ The activity boss uses dedicated level-83 templates with no `AIName`, no `smart_
 - The panel's health multiplier is a global knob: changing it scales all tiers proportionally.
 - SQL for the templates: `sql/2026_09_23_activity_boss_tiers_190090_190093.sql` (see `sql/README.md` for the deploy runbook).
 
+## Feel and mechanics (skill feel / target picking / soft enrage / wipe detection / call-out warning / world announcements)
+
+All six config groups live in the ext table (panel tabs `feel`, `mechanics`, `announce`):
+
+| Group | Effect |
+|---|---|
+| `feel_skill` | Instant-cast toggle (`skill_instant_cast`), combo trigger chance factor and global cooldown, skill pick window, condition thresholds, per-preset entry gating |
+| `feel_target` | Final-pick score spread (`target_random_spread_pct`), threat factor toggle, target score weights |
+| `enrage` | Past `soft_enrage_seconds` of combat, one stack every `soft_enrage_interval_seconds`: cast the enrage spell + raise movement speed per stack + yell |
+| `wipe` | No living unit in the threat table for `wipe_grace_seconds`: stop attacking, clear threat, heal back to `wipe_reset_health_pct`, yell |
+| `announce` | On/off and text for spawn / phase / restore world announcements (placeholders `{BOSS_NAME}`, `{PHASE}`, `{HEALTH_PCT}`) |
+| `marker` | Before a single-target call-out, mark the victim and yell, then cast for real `marker_warning_delay_seconds` later |
+
+- Key/value settings (`skill_condition_thresholds_text`, `target_score_weights_text`,
+  `skill_disabled_spells_text`, `announce_texts_text`) take one `key=value` per line. **Any key left out
+  falls back to the script default**, so only the lines you want to change are needed.
+- `skill_disabled_spells_text` gates entries per preset (`presetkey=spellId,spellId`): a match is dropped
+  from that preset's skill pools, opening skills and combos alike; a phase pool emptied by gating falls back
+  to the ungated pool so the boss never runs out of skills.
+- Target picking scores threat (`threat_factor_enabled`) and randomises only among candidates scoring at
+  least `best × (1 − spread%)` — spread 0 always takes the top candidate. Movement is gated on casting, so
+  the boss never interrupts its own cast by chasing.
+- Defaults: soft enrage off, wipe detection on, call-out warning on. Reload with `.boss config reload`
+  (the panel does it on save); no boss respawn is needed.
+
 ## Regression constraints (guarded by the smoke test)
 
 - `GetCreatureByGUID()` does not exist in mod-ale/Eluna — look a live boss up with `GetMapById()` + `GetUnitGUID(low, entry)` + `Map:GetWorldObject()`.
@@ -309,7 +334,7 @@ The activity boss uses dedicated level-83 templates with no `AIName`, no `smart_
 
 ## Testing without a server
 
-`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts its invariants: load-time behaviour, SQL construction for all config tables, ext-table DDL/INSERT column consistency, the schema contract self-check, command markers, `.boss config show` / `.boss pools` output, "database values win over script defaults", `.boss clear` side effects, event registration, the daily schedule, the random skill preset, **skill pool / combo content** (every combo spell must live in its preset's pools, combo names globally unique, at least 6 combos per preset, 4 difficulties x 10 presets scale without hitting the `ClampNumber(10,80)` clamp, default-library yell coverage for every combo), **combo casting (offline driven)** (fake boss + fake player drive the real `TryComboChain` and cast loop: the trigger tick only fires the first spell and queues the rest, the queue drains one spell per idle tick, the accumulated cast sequence equals a declared combo, per-combo and global cooldowns are written at trigger time, the yell equals the configured text), **reward pools** (rows loaded from `boss_reward_pools` in `sort_order`, the code-default fallback, bitmap bit mapping for pool ids outside 1..6, a full `OnBossDied` payout run, per-pool gold), **cross-restart recovery** (rebuild with the recorded spawn point / preset / health percentage, plus the schedule-closed and bad-entry paths), **offline delivery** (`SendMail` for a contributor who is gone at kill time) and **write-failure visibility** (a failing write is logged and counted instead of silently passing), multi-realm binding, and the regressions above. See `tools/boss-lua-smoke/README.md`.
+`tools/boss-lua-smoke/smoke.lua` loads `boss.lua` into a stubbed Eluna environment (no `worldserver` needed) and asserts its invariants: load-time behaviour, SQL construction for all config tables, ext-table DDL/INSERT column consistency, the schema contract self-check, command markers, `.boss config show` / `.boss pools` output, "database values win over script defaults", `.boss clear` side effects, event registration, the daily schedule, the random skill preset, **skill pool / combo content** (every combo spell must live in its preset's pools, combo names globally unique, at least 6 combos per preset, 4 difficulties x 10 presets scale without hitting the `ClampNumber(10,80)` clamp, default-library yell coverage for every combo), **combo casting (offline driven)** (fake boss + fake player drive the real `TryComboChain` and cast loop: the trigger tick only fires the first spell and queues the rest, the queue drains one spell per idle tick, the accumulated cast sequence equals a declared combo, per-combo and global cooldowns are written at trigger time, the yell equals the configured text), **reward pools** (rows loaded from `boss_reward_pools` in `sort_order`, the code-default fallback, bitmap bit mapping for pool ids outside 1..6, a full `OnBossDied` payout run, per-pool gold), **cross-restart recovery** (rebuild with the recorded spawn point / preset / health percentage, plus the schedule-closed and bad-entry paths), **offline delivery** (`SendMail` for a contributor who is gone at kill time), **write-failure visibility** (a failing write is logged and counted instead of silently passing), **feel and mechanics** (key/value config parsing with per-key fallback, condition thresholds and score weights actually steering decisions, entry gating removing entries from pools/opening/combos, the threat factor toggle, the final-pick score window, soft enrage stacking and its cap, wipe detection stopping/clearing/healing, the delayed call-out cast, and announcement toggles plus placeholder substitution), multi-realm binding, and the regressions above. See `tools/boss-lua-smoke/README.md`.
 
 ```
 lua smoke.lua /path/to/boss.lua          # exit 0 = all assertions pass

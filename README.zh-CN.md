@@ -28,7 +28,7 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 | `.boss clear`（别名 `.boss despawn`） | 直接移除活跃 Boss、不发奖励并复位运行时记录 |
 | `.boss rebase` | 按模板重算基准血量再套用倍率（**仅脱战可用**） |
 | `.boss config reload` | 从 `ac_eluna` 热加载配置（AGMP 保存后自动调用） |
-| `.boss config show [分组]` | 查看当前生效的配置项（不带分组则列出 20 个分组） |
+| `.boss config show [分组]` | 查看当前生效的配置项（不带分组则列出 26 个分组） |
 | `.boss pools` | 查看当前生效的奖池（位号/池名/概率/人数模式/奖品数/金币区间/是否公告）与来源 |
 | `.boss preset list` / `.boss preset <key>` | 查看 / 切换技能池预设 |
 | `.boss preset random on\|off` | 开关「每次刷新随机选一套技能预设」（与面板同一份 ext 配置） |
@@ -42,7 +42,7 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 默认值不生效（引导写入用 `INSERT IGNORE`）。改配置按优先级：
 
 1. **AGMP 面板** —— 「基础配置」Tab 改主表 `boss_activity_config` 的列（Boss 身份/属性/刷新点/技能池/选人权重）；
-   「扩展配置」Tab 改 `boss_activity_config_ext`（喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板/技能池随机/跨重启恢复/结算开关/定时启停，
+   「扩展配置」Tab 改 `boss_activity_config_ext`（喊话/嘲讽/AI 节奏/阶段阈值/巡逻/小怪/援军/职业/受管模板/技能池随机/跨重启恢复/结算开关/定时启停/技能手感/目标选择/软狂暴/团灭判定/世界公告/点名预警，
    内部再按二级 Tab 分组）。
 2. **直接改数据库** —— `boss_activity_config`（面板共享列）与 `boss_activity_config_ext`（脚本私有列）都可以。
 3. 改脚本 §3 的默认值 —— 只影响「数据库里还没有这一行」的全新部署。
@@ -54,7 +54,7 @@ AzerothCore 3.3.5a 的 Eluna 活动 Boss 脚本：带运行时持久化、配置
 | 表 | 内容 | 谁写 |
 |---|---|---|
 | `boss_activity_config` | Boss 身份、等级/体型/血量倍率、光环、友方援军、刷新点、技能池、**选人权重/有效参战范围** | AGMP 面板（`REPLACE INTO` 整行重写）+ Lua |
-| `boss_activity_config_ext` | 喊话、战斗嘲讽（12 组文本）、AI 节奏、战斗阶段阈值、巡逻、小怪 AI、援军模板、**职业类型（AI 选目标用）**、职业过滤映射（奖池用）、受管模板、**技能池随机**、**跨重启恢复**、**结算开关**、**定时启停** | Lua 建表/引导 + AGMP 面板（`INSERT ... ON DUPLICATE KEY UPDATE` 只改提交的列） |
+| `boss_activity_config_ext` | 喊话、战斗嘲讽（12 组文本）、AI 节奏、战斗阶段阈值、巡逻、小怪 AI、援军模板、**职业类型（AI 选目标用）**、职业过滤映射（奖池用）、受管模板、**技能池随机**、**跨重启恢复**、**结算开关**、**定时启停**、**技能手感/目标选择/软狂暴/团灭判定/世界公告/点名预警** | Lua 建表/引导 + AGMP 面板（`INSERT ... ON DUPLICATE KEY UPDATE` 只改提交的列） |
 | `boss_reward_pools` | **奖池**：每区任意行数，每行独立配置概率/人数模式/奖品/金币区间/是否公告 | AGMP 面板「奖池」页 + Lua 只读 |
 
 必须拆两张表：AGMP 保存主表时用 `REPLACE INTO` 重写整行，凡不在它列清单里的列都会被重置为建表
@@ -263,6 +263,29 @@ Boss 是脚本临时生成的生物（从不 `save=true` 落进 world 库），�
 - 面板的「血量倍率」是全局旋钮，改它会让所有档位等比缩放。
 - 建档 SQL：`sql/2026_09_23_activity_boss_tiers_190090_190093.sql`（部署步骤见 `sql/README.md`）。
 
+## 手感与机制（技能手感 / 目标选择 / 软狂暴 / 团灭判定 / 点名预警 / 世界公告）
+
+六组配置都在扩展表（面板「扩展配置」的 feel / mechanics / announce 三个二级 Tab）：
+
+| 组 | 作用 |
+|---|---|
+| `feel_skill` | 读条/瞬发开关（`skill_instant_cast`）、连招触发率系数与全局冷却、技能选取随机窗口、条件阈值、条目启停 |
+| `feel_target` | 终选分差窗口（`target_random_spread_pct`）、威胁因子开关、目标评分权重 |
+| `enrage` | 战斗超过 `soft_enrage_seconds` 后每 `soft_enrage_interval_seconds` 叠一层：施放强化法术 + 按层数提升移速 + 喊话 |
+| `wipe` | 威胁表连续 `wipe_grace_seconds` 秒没有存活单位 → 停手 + 清仇恨 + 回血到 `wipe_reset_health_pct` + 喊话 |
+| `announce` | 生成 / 阶段 / 恢复三类世界公告的开关与文案（占位符 `{BOSS_NAME}` / `{PHASE}` / `{HEALTH_PCT}`） |
+| `marker` | 单体点名技能出手前先挂标记光环 + 喊话，延迟 `marker_warning_delay_seconds` 秒再真正施放 |
+
+- 键值型配置（`skill_condition_thresholds_text` / `target_score_weights_text` /
+  `skill_disabled_spells_text` / `announce_texts_text`）每行一条 `键=值`。**没写到的键一律回退脚本默认值**，
+  所以只填要改的那几行；键名与默认值见面板字段说明。
+- `skill_disabled_spells_text` 按预设禁用条目（`预设key=spellId,spellId`）：命中条目会从该预设的
+  技能池、开场技能与连招里一并剔除；某个阶段池被清空时忽略本轮启停（宁可用默认技能也不让 Boss 停摆）。
+- 目标选择：评分含仇恨因子（`threat_factor_enabled`），终选只在「不低于最高分 × (1 − 窗口%)」的候选里随机，
+  窗口 0 = 永远取最高分。移动指令带读条门控：Boss 正在施法时不下发移动，避免自己打断读条。
+- 三项机制默认值：软狂暴关、团灭判定开、点名预警开。改完走 `.boss config reload`（面板保存会自动调用），
+  不需要重生 Boss。
+
 ## 回归约束（冒烟测试守住的不变量）
 
 - mod-ale/Eluna **没有** `GetCreatureByGUID()` —— 找回活跃 Boss 要用 `GetMapById()` + `GetUnitGUID(low, entry)` + `Map:GetWorldObject()`。
@@ -288,6 +311,8 @@ Boss 是脚本临时生成的生物（从不 `save=true` 落进 world 库），�
 **奖池**（从 `boss_reward_pools` 按 `sort_order` 读行、代码默认回退、非 1..6 位号的位图映射、跑通整条 `OnBossDied` 实发流程、池内金币）、
 **跨重启恢复**（按记录的刷新点/预设/血量百分比重建，含"时段外跳过"与"entry 非法失败"两条负路径）、
 **离线补发**（击杀时已下线的贡献者收到 `SendMail`）与**写库失败可见**（写失败必须落日志并计数，不允许静默通过）、
+**手感与机制**（键值配置的读取与逐键回退、条件阈值与评分权重真的参与判定、条目启停从技能池/开场/连招三处剔除、
+威胁因子开关、终选分差窗口、软狂暴叠层与上限、团灭判定的停手/清仇恨/回血、点名预警的延迟出手、世界公告的开关与占位符替换）、
 多区绑定，以及上面那些回归。用法见 `tools/boss-lua-smoke/README.md`。
 
 ```

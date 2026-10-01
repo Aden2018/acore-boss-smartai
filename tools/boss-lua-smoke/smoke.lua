@@ -190,6 +190,42 @@ local EXT_VALUES = {
     activity_schedule_enabled = 1,
     activity_schedule_windows = "20:00-22:00; 1-5@08:00-09:00",
     activity_schedule_clear_on_close = 1,
+    -- [feel_skill] 技能手感：读条/瞬发、连招概率与全局冷却保持默认值（由专门的用例改写后重载验证）；
+    -- 条件阈值给与默认等价的子集（keyedlines 只覆盖写到的键，其余键回退脚本默认）
+    skill_instant_cast = 0,
+    combo_trigger_chance_pct = 100,
+    combo_global_cooldown_seconds = 5,
+    skill_pick_random_top = 1,
+    skill_condition_thresholds_text = "multi_target=1\nmulti_melee=1\nmany_attackers=5",
+    skill_disabled_spells_text = "",
+    -- [feel_target] 目标选择：关掉威胁因子与随机窗口 → 目标选择确定化（既有断言不受随机影响）
+    target_random_spread_pct = 0,
+    threat_factor_enabled = 0,
+    target_score_weights_text = "base=50\nthreat=60\ninterrupt=100\ncasting=45",
+    -- [enrage] 软狂暴：保持关闭（这是文件默认值），数值给非默认值以证明 DB 值进配置
+    soft_enrage_enabled = 0,
+    soft_enrage_seconds = 120,
+    soft_enrage_interval_seconds = 15,
+    soft_enrage_spell_id = 8600,
+    soft_enrage_speed_pct_per_stack = 7,
+    soft_enrage_max_stacks = 4,
+    -- [wipe] 团灭判定：关掉（文件默认是开），避免影响既有的战斗模拟断言
+    wipe_detect_enabled = 0,
+    wipe_grace_seconds = 20,
+    wipe_reset_health_pct = 80,
+    -- [announce] 世界公告：三个开关都关掉（文件默认是开），避免给既有用例多发世界消息
+    announce_spawn_enabled = 0,
+    announce_phase_enabled = 0,
+    announce_restore_enabled = 0,
+    announce_texts_text = "spawn=DB 生成公告\nphase=DB 阶段公告 {PHASE}\nrestore=DB 恢复公告",
+    -- [marker] 点名预警：关掉（文件默认是开），避免给技能施放路径插入延迟
+    marker_warning_enabled = 0,
+    marker_warning_delay_seconds = 3,
+    marker_warning_spell_id = 467,
+    -- [taunts] 手感三组新喊话（未启用对应机制时也不会被取用，仅用于验证"取自数据库"）
+    taunt_soft_enrage_yells_text = "DB软狂暴喊话1\nDB软狂暴喊话2",
+    taunt_wipe_yells_text = "DB团灭喊话",
+    taunt_marker_warning_yells_text = "DB预警喊话 {PLAYER_NAME}",
     -- 写入后的回读校验只取这一列（SELECT `updated_at` FROM ... LIMIT 1）
     updated_at = 1756700000,
 }
@@ -213,8 +249,23 @@ local RECOVERY_COLUMNS = {
     "health_sample_interval_sec", "recovery_min_health_pct", "boss_recovered_yell",
 }
 local REWARD_SETTLEMENT_COLUMNS = { "last_hit_only_qualifies", "offline_reward_delivery" }
+
+-- 再模拟一次"脚本升级后描述表又多了批 5 的 28 列（手感/目标/软狂暴/团灭/公告/点名 + taunts 三列）"：
+-- 同样必须逐列自动补上，否则引导写入整条失败。
+local PLAY_FEEL_COLUMNS = {
+    "skill_instant_cast", "combo_trigger_chance_pct", "combo_global_cooldown_seconds",
+    "skill_pick_random_top", "skill_condition_thresholds_text", "skill_disabled_spells_text",
+    "target_random_spread_pct", "threat_factor_enabled", "target_score_weights_text",
+    "soft_enrage_enabled", "soft_enrage_seconds", "soft_enrage_interval_seconds",
+    "soft_enrage_spell_id", "soft_enrage_speed_pct_per_stack", "soft_enrage_max_stacks",
+    "wipe_detect_enabled", "wipe_grace_seconds", "wipe_reset_health_pct",
+    "announce_spawn_enabled", "announce_phase_enabled", "announce_restore_enabled",
+    "announce_texts_text",
+    "marker_warning_enabled", "marker_warning_delay_seconds", "marker_warning_spell_id",
+    "taunt_soft_enrage_yells_text", "taunt_wipe_yells_text", "taunt_marker_warning_yells_text",
+}
 local NEW_EXT_COLUMNS = {}
-for _, group in ipairs({ RECOVERY_COLUMNS, REWARD_SETTLEMENT_COLUMNS }) do
+for _, group in ipairs({ RECOVERY_COLUMNS, REWARD_SETTLEMENT_COLUMNS, PLAY_FEEL_COLUMNS }) do
     for _, column in ipairs(group) do NEW_EXT_COLUMNS[#NEW_EXT_COLUMNS + 1] = column end
 end
 
@@ -981,12 +1032,13 @@ local groupKeys = {
     "identity", "basic", "ally", "yells", "taunts", "ai", "phase", "patrol",
     "minion", "skill", "skill_random", "respawn", "spawnpoints", "schedule",
     "helper", "reward", "recovery", "class_ai", "class_reward", "tier",
+    "feel_skill", "feel_target", "enrage", "wipe", "announce", "marker",
 }
 local missingGroups = {}
 for _, group in ipairs(groupKeys) do
     if not groupText:find(group, 1, true) then missingGroups[#missingGroups + 1] = group end
 end
-assertTrue(#missingGroups == 0, "配置分组齐全（20 组：含新增 recovery 与拆开的职业两组）" ..
+assertTrue(#missingGroups == 0, "配置分组齐全（26 组：含批 5 新增的手感/软狂暴/团灭/公告/点名五组）" ..
     (#missingGroups > 0 and ("（缺: " .. table.concat(missingGroups, ",") .. "）") or ""))
 
 -- 奖池不再是配置列：不能再出现 reward_pool_N 分组
@@ -997,7 +1049,7 @@ end
 assertTrue(#staleGroups == 0, "配置分组里已无 6 个奖池组（奖池改由 boss_reward_pools 表维护）" ..
     (#staleGroups > 0 and ("（仍有: " .. table.concat(staleGroups, ",") .. "）") or ""))
 
-assertEq(#groupKeys, 20, "分组清单常量与 boss.lua 的 BOSS_CONFIG_GROUP_ORDER 一致（20 组）")
+assertEq(#groupKeys, 26, "分组清单常量与 boss.lua 的 BOSS_CONFIG_GROUP_ORDER 一致（26 组）")
 
 -- 各组声明的项数之和必须等于两张描述表的项数之和（漏登记/漏分组会立刻暴露）
 local listedTotal, listedGroupCount = 0, 0
@@ -3255,6 +3307,10 @@ local childEnv = setmetatable({
 }, { __index = env })
 
 local boundary = #recorded.sql
+-- 子环境加载会把自己的回调注册进 engineCallbacks，若共用同一张表就会**顶掉主会话的回调**
+-- （后续 bossLocal 会取到子环境的 local）。这里临时换成空表，跑完再把主会话的表装回去。
+local savedEngineCreature, savedEnginePlayer = engineCallbacks.creature, engineCallbacks.player
+engineCallbacks.creature, engineCallbacks.player = {}, {}
 local childChunk, childErr = load(rewrittenConfigKey, "@" .. bossPath .. ":realm-rewrite", "t", childEnv)
 if not childChunk then
     fail("改写后加载失败: " .. tostring(childErr))
@@ -3270,6 +3326,7 @@ end
 -- （AzerothCore 把 "." 去掉后才交给 handler，runConsoleCommand 传的是去掉点之后的字符串）。
 -- 贡献表的写入在离线环境里跑不到（需要真的打死 Boss），所以它的列清单用源码静态检查兜底。
 runConsoleCommand("boss config reload")
+engineCallbacks.creature, engineCallbacks.player = savedEngineCreature, savedEnginePlayer
 local childSql = {}
 for i = boundary + 1, #recorded.sql do childSql[#childSql + 1] = recorded.sql[i] end
 auditBinding(childSql, targetDb, "改为 key=" .. targetRuntimeKey .. " 的部署")
@@ -3325,6 +3382,336 @@ for _, item in ipairs(childSql) do
     end
 end
 assertTrue(poolKeySeen, "奖池查询使用本区 state_key（" .. targetRuntimeKey .. "）")
+
+-- ===================================================================== 批 5：趣味与智能增强
+-- 覆盖：条件阈值/评分权重/连招概率/条目启停/读条开关（参数层）、威胁因子与终选窗口、
+--       软狂暴、团灭判定、点名预警、生成/阶段/恢复世界公告、移动门控接入。
+io.write("\n== 批 5：趣味与智能增强 ==\n")
+;(function()
+local feelConfig = bossLocal("BOSS_CONFIG")
+local feelSkillAI = bossLocal("SkillAI")
+local feelTargetSelector = bossLocal("TargetSelector")
+local applySkillConfig = bossLocal("ApplySkillConfig")
+assertTrue(type(feelConfig) == "table", "批 5：取到运行期 BOSS_CONFIG")
+assertTrue(type(feelSkillAI) == "table" and type(feelTargetSelector) == "table",
+    "批 5：取到 SkillAI / TargetSelector")
+
+-- 假对象按 userdata 处理（IsUnitValid 要求 type() == "userdata"），与连招段/奖池实发段同一手法
+local savedFeelType = env.type
+env.type = function(value)
+    if type(value) == "table" and rawget(value, "__fake") then return "userdata" end
+    return savedFeelType(value)
+end
+
+-- ---------------------------------------------------------------- 1. 参数层：新分组取自数据库
+assertTrue(showGroup("enrage"):find("soft_enrage_seconds (softEnrageSeconds) = 120", 1, true) ~= nil,
+    "批 5：[enrage] 秒数取自数据库（120，非文件默认 300）")
+assertTrue(showGroup("feel_target"):find("target_random_spread_pct (targetRandomSpreadPct) = 0", 1, true) ~= nil,
+    "批 5：[feel_target] 终选窗口取自数据库（0，非文件默认 25）")
+assertTrue(showGroup("wipe"):find("wipe_grace_seconds (wipeGraceSec) = 20", 1, true) ~= nil,
+    "批 5：[wipe] 宽限期取自数据库（20，非文件默认 12）")
+assertTrue(showGroup("announce"):find("announce_phase_enabled (announcePhaseEnabled) = false", 1, true) ~= nil,
+    "批 5：[announce] 阶段公告开关取自数据库（关）")
+assertTrue(showGroup("marker"):find("marker_warning_delay_seconds (markerWarningDelaySec) = 3", 1, true) ~= nil,
+    "批 5：[marker] 预警延迟取自数据库（3，非文件默认 2）")
+assertTrue(showGroup("taunts"):find("DB团灭喊话", 1, true) ~= nil,
+    "批 5：[taunts] 新增三组喊话取自数据库")
+
+assertEq(env.GetConditionThreshold("many_attackers"), 5,
+    "批 5：条件阈值取数据库值（many_attackers=5，非文件默认 4）")
+assertEq(env.GetConditionThreshold("multi_melee_range"), 8,
+    "批 5：数据库没写到的条件键回退脚本默认（multi_melee_range=8）")
+assertEq(env.GetScoreWeight("casting"), 45,
+    "批 5：评分权重取数据库值（casting=45，非文件默认 50）")
+assertEq(env.GetScoreWeight("class_healer"), 40,
+    "批 5：数据库没写到的权重键回退脚本默认（class_healer=40）")
+
+-- ---------------------------------------------------------------- 2. 条件阈值真的参与判定
+local function feelUnit(guidLow, unitName, classId)
+    local unit = {__fake = true, guidLow = guidLow, name = unitName, classId = classId or 1,
+        threat = 0, healthPct = 100, casting = false, alive = true}
+    unit.IsInWorld = function() return true end
+    unit.IsAlive = function() return unit.alive end
+    unit.IsPlayer = function() return true end
+    unit.GetGUIDLow = function() return unit.guidLow end
+    unit.GetGUID = function() return unit.guidLow end
+    unit.GetName = function() return unit.name end
+    unit.GetClass = function() return unit.classId end
+    unit.GetHealthPct = function() return unit.healthPct end
+    unit.IsCasting = function() return unit.casting end
+    unit.GetDistance = function() return 5 end
+    return unit
+end
+
+local thresholdCreature = {__fake = true, healthPct = 100}
+thresholdCreature.IsInWorld = function() return true end
+thresholdCreature.GetHealthPct = function() return thresholdCreature.healthPct end
+thresholdCreature.GetThreatList = function() return {} end
+thresholdCreature.GetDistance = function() return 5 end
+
+local fourEnemies = {}
+for i = 1, 4 do fourEnemies[i] = feelUnit(900 + i, "敌方" .. i) end
+thresholdCreature.GetThreatList = function() return fourEnemies end
+assertTrue(feelSkillAI:CheckCondition("many_attackers", thresholdCreature, nil) == false,
+    "批 5：many_attackers 阈值 5 时 4 个敌人不成立（阈值来自数据库）")
+
+local fiveEnemies = {}
+for i = 1, 5 do fiveEnemies[i] = feelUnit(910 + i, "敌方" .. i) end
+thresholdCreature.GetThreatList = function() return fiveEnemies end
+assertTrue(feelSkillAI:CheckCondition("many_attackers", thresholdCreature, nil) == true,
+    "批 5：many_attackers 阈值 5 时 5 个敌人成立")
+
+local targetLowHp = feelUnit(930, "残血目标")
+targetLowHp.healthPct = 20
+assertTrue(feelSkillAI:CheckCondition("low_hp_target", thresholdCreature, targetLowHp) == true,
+    "批 5：low_hp_target 用脚本默认阈值（25%）判定成立")
+targetLowHp.healthPct = 40
+assertTrue(feelSkillAI:CheckCondition("low_hp_target", thresholdCreature, targetLowHp) == false,
+    "批 5：low_hp_target 在 40% 血时不成立")
+
+-- ---------------------------------------------------------------- 3. 威胁因子与终选窗口
+local tank = feelUnit(601, "坦克"); tank.threat = 900; tank.classId = 1
+local dps = feelUnit(602, "输出"); dps.threat = 100; dps.classId = 1
+local threatCreature = {__fake = true}
+threatCreature.IsInWorld = function() return true end
+threatCreature.GetDistance = function() return 5 end
+threatCreature.GetThreat = function(_, unit) return unit.threat or 0 end
+
+feelConfig.threatFactorEnabled = true
+local threatContext = env.BuildThreatContext(threatCreature, {tank, dps})
+assertEq(threatContext.maxThreat, 900, "批 5：威胁上下文记录最高威胁值")
+local tankScore = feelTargetSelector:GetThreatScore(tank, threatCreature, threatContext)
+local dpsScore = feelTargetSelector:GetThreatScore(dps, threatCreature, threatContext)
+assertTrue(tankScore > dpsScore,
+    string.format("批 5：威胁因子开启后高仇恨目标评分更高（坦克 %.1f > 输出 %.1f）", tankScore, dpsScore))
+feelConfig.threatFactorEnabled = false
+local noThreatContext = env.BuildThreatContext(threatCreature, {tank, dps})
+local tankScoreOff = feelTargetSelector:GetThreatScore(tank, threatCreature, noThreatContext)
+local dpsScoreOff = feelTargetSelector:GetThreatScore(dps, threatCreature, noThreatContext)
+assertEq(tankScoreOff, dpsScoreOff, "批 5：威胁因子关闭时同职业同血量目标评分相同（仇恨不参与）")
+assertTrue(tankScoreOff < tankScore, "批 5：关闭威胁因子后评分回落（威胁加分被移除）")
+feelConfig.threatFactorEnabled = true
+
+local pickCandidates = {
+    {unit = tank, score = 100},
+    {unit = dps, score = 95},
+}
+local narrowPick = env.PickCandidateWithinSpread(pickCandidates, 0)
+assertTrue(narrowPick.unit == tank, "批 5：终选窗口 0 → 只取最高分候选")
+local seenInWindow = {}
+for _ = 1, 100 do
+    local picked = env.PickCandidateWithinSpread(pickCandidates, 25)
+    seenInWindow[picked.unit] = true
+end
+assertTrue(seenInWindow[tank] == true and seenInWindow[dps] == true,
+    "批 5：终选窗口 25% → 分差在窗口内的两个候选都会被选中")
+local wideCandidates = {
+    {unit = tank, score = 100},
+    {unit = dps, score = 50},
+}
+local strictPick = env.PickCandidateWithinSpread(wideCandidates, 25)
+assertTrue(strictPick.unit == tank, "批 5：分差超出窗口的候选不参与随机（100 vs 50）")
+
+-- ---------------------------------------------------------------- 4. 世界公告
+feelConfig.announcePhaseEnabled = true
+local beforeAnnounce = #recorded.replies
+env.BossAnnounce("phase", {BOSS_NAME = "送财童子", PHASE = 2, HEALTH_PCT = 55})
+local announceText = table.concat(recorded.replies, " | ", beforeAnnounce + 1, #recorded.replies)
+assertTrue(announceText:find("[WORLD]", 1, true) ~= nil, "批 5：阶段世界公告已发出")
+assertTrue(announceText:find("DB 阶段公告 2", 1, true) ~= nil,
+    "批 5：公告文案取自数据库且 {PHASE} 已替换")
+feelConfig.announcePhaseEnabled = false
+local beforeSilent = #recorded.replies
+env.BossAnnounce("phase", {BOSS_NAME = "送财童子", PHASE = 3})
+assertEq(#recorded.replies, beforeSilent, "批 5：关闭开关后不发世界公告")
+feelConfig.announcePhaseEnabled = true
+local unknownEvent = env.BossAnnounce("no_such_event", {})
+assertTrue(unknownEvent == false, "批 5：未登记的事件键不发公告")
+
+-- ---------------------------------------------------------------- 5. 软狂暴
+local function feelBossShell(guidLow)
+    local boss = {__fake = true, guidLow = guidLow, casts = {}, yells = {}, speeds = {},
+        maxHealth = 1000, health = 1000, moved = 0}
+    boss.IsInWorld = function() return true end
+    boss.IsAlive = function() return true end
+    boss.GetGUIDLow = function() return boss.guidLow end
+    boss.GetEntry = function() return 190090 end
+    boss.GetName = function() return "送财童子" end
+    boss.GetMapId = function() return 571 end
+    boss.GetInstanceId = function() return 0 end
+    boss.GetX = function() return 4108.16 end
+    boss.GetY = function() return 5316.85 end
+    boss.GetZ = function() return 28.76 end
+    boss.GetMaxHealth = function() return boss.maxHealth end
+    boss.SetHealth = function(_, value) boss.health = value end
+    boss.GetHealthPct = function() return 90 end
+    boss.GetSpeedRate = function() return 1 end
+    boss.SetSpeed = function(_, moveType, rate) table.insert(boss.speeds, {moveType = moveType, rate = rate}) end
+    boss.CastSpell = function(_, target, spellId, triggered)
+        table.insert(boss.casts, {spellId = tonumber(spellId), target = target, triggered = triggered})
+        return true
+    end
+    boss.SendUnitYell = function(_, message) table.insert(boss.yells, tostring(message)) end
+    boss.AttackStop = function() boss.attackStopped = true end
+    boss.ClearThreatList = function() boss.threatCleared = true end
+    boss.GetThreatList = function() return boss.threatList or {} end
+    boss.GetVictim = function() return boss.victim end
+    boss.GetDistance = function() return 5 end
+    return boss
+end
+
+local enrageBoss = feelBossShell(8801)
+feelConfig.softEnrageEnabled = true
+local enrageState = {combatTime = 0}
+env.UpdateSoftEnrage(enrageBoss, enrageState)
+assertEq(enrageState.softEnrageStacks or 0, 0, "批 5：未到软狂暴起算时间不叠层")
+enrageState.combatTime = 120000
+env.UpdateSoftEnrage(enrageBoss, enrageState)
+assertEq(enrageState.softEnrageStacks, 1, "批 5：到 120 秒叠第 1 层（起算时间取自数据库）")
+assertEq(#enrageBoss.casts, 1, "批 5：叠层施放强化法术")
+assertEq(enrageBoss.casts[1].spellId, 8600, "批 5：强化法术取数据库值（8600）")
+assertEq(#enrageBoss.speeds, 1, "批 5：叠层调整移动速度")
+assertTrue(math.abs(enrageBoss.speeds[1].rate - 1.07) < 1e-6,
+    "批 5：移速 = 基准 × (1 + 7% × 层数)（实际 " .. tostring(enrageBoss.speeds[1].rate) .. "）")
+assertEq(#enrageBoss.yells, 1, "批 5：叠层喊话一次（文本取自数据库）")
+for _ = 1, 8 do
+    enrageState.combatTime = enrageState.combatTime + 15000
+    env.UpdateSoftEnrage(enrageBoss, enrageState)
+end
+assertEq(enrageState.softEnrageStacks, 4, "批 5：层数不超过上限（数据库值 4）")
+feelConfig.softEnrageEnabled = false
+
+-- ---------------------------------------------------------------- 6. 团灭判定
+local wipeBoss = feelBossShell(8802)
+local wipeState = {}
+local deadPlayer = feelUnit(940, "已阵亡"); deadPlayer.alive = false
+local wipeThreat = {deadPlayer}
+feelConfig.wipeDetectEnabled = true
+assertTrue(env.CheckBossWipe(wipeBoss, wipeState, wipeThreat, 5000) == false,
+    "批 5：团灭宽限期内不停手")
+for _ = 1, 5 do env.CheckBossWipe(wipeBoss, wipeState, wipeThreat, 5000) end
+assertTrue(wipeBoss.attackStopped == true, "批 5：团灭后停手（AttackStop）")
+assertTrue(wipeBoss.threatCleared == true, "批 5：团灭后清仇恨（ClearThreatList）")
+assertEq(wipeBoss.health, 800, "批 5：团灭后回血到数据库值 80%")
+assertTrue(#wipeBoss.yells >= 1 and wipeBoss.yells[1]:find("DB团灭喊话", 1, true) ~= nil,
+    "批 5：团灭喊话取自数据库")
+local alivePlayer = feelUnit(941, "存活者")
+assertTrue(env.CheckBossWipe(wipeBoss, wipeState, {alivePlayer}, 5000) == false,
+    "批 5：威胁表里还有存活单位时不判团灭")
+assertEq(wipeState.wipeElapsedMs, 0, "批 5：出现存活单位后团灭计时清零")
+
+-- ---------------------------------------------------------------- 7. 点名预警
+local warnBoss = feelBossShell(8803)
+local warnPlayer = feelUnit(501, "测试玩家")
+local warnState = {combatTime = 1000}
+local warnSkill = {spellId = 64213, name = "闪电链", minCD = 5, maxCD = 6,
+    target = "victim", priority = 7, condition = "none"}
+feelConfig.markerWarningEnabled = true
+assertTrue(feelSkillAI:TryMarkerWarning(warnBoss, warnPlayer, warnSkill, warnState, "phase1CD") == true,
+    "批 5：单体点名技能先进入预警（不立即出手）")
+assertEq(warnBoss.casts[1].spellId, 467, "批 5：预警给目标挂标记光环（数据库法术 467）")
+assertEq(warnBoss.casts[1].triggered, true, "批 5：标记光环按触发式施放（无前摇）")
+assertTrue(type(warnState.pendingWarn) == "table" and warnState.pendingWarn.skill == warnSkill,
+    "批 5：预警记入 pendingWarn（同一技能不会重复预警）")
+assertEq(#warnBoss.yells, 1, "批 5：预警喊话一次")
+assertTrue(warnBoss.yells[1]:find("测试玩家", 1, true) ~= nil,
+    "批 5：预警喊话的 {PLAYER_NAME} 已替换为被点名者")
+feelSkillAI:ResolvePendingWarning(warnBoss, warnState)
+assertEq(#warnBoss.casts, 1, "批 5：未到预警延迟不出手")
+warnState.combatTime = warnState.combatTime + 3000
+feelSkillAI:ResolvePendingWarning(warnBoss, warnState)
+assertEq(#warnBoss.casts, 2, "批 5：延迟到点后真正出手")
+assertEq(warnBoss.casts[2].spellId, 64213, "批 5：延迟后施放的是被预警的原技能")
+assertTrue(warnState.pendingWarn == nil, "批 5：出手后清空预警状态")
+assertTrue(warnState.phase1CD ~= nil, "批 5：出手后按技能冷却记账（phase1CD）")
+assertTrue(feelSkillAI:TryMarkerWarning(warnBoss, warnPlayer, {spellId = 1, target = "self"}, warnState, "phase1CD") == false,
+    "批 5：自身目标技能不触发点名预警")
+feelConfig.markerWarningEnabled = false
+assertTrue(feelSkillAI:TryMarkerWarning(warnBoss, warnPlayer, warnSkill, warnState, "phase1CD") == false,
+    "批 5：关闭点名预警后直接出手（不预警）")
+feelConfig.markerWarningEnabled = true
+
+-- ---------------------------------------------------------------- 8. 读条 / 瞬发开关
+local castBoss = feelBossShell(8804)
+local castState = {}
+feelConfig.skillInstantCast = true
+feelSkillAI:CastSkill(castBoss, warnPlayer, warnSkill, castState)
+assertEq(castBoss.casts[1].triggered, true, "批 5：瞬发开关开启时按触发式施放（无前摇）")
+feelConfig.skillInstantCast = false
+feelSkillAI:CastSkill(castBoss, warnPlayer, warnSkill, castState)
+assertEq(castBoss.casts[2].triggered, false, "批 5：瞬发开关关闭时走读条（有前摇、可被打断）")
+
+-- ---------------------------------------------------------------- 9. 条目启停（每预设禁用 spellId）
+local activePresetKey = bossLocal("ACTIVE_SKILL_PRESET_KEY")
+assertTrue(type(activePresetKey) == "string", "批 5：取到当前生效预设 key（" .. tostring(activePresetKey) .. "）")
+local function poolSpellIds()
+    local ids, pools = {}, bossLocal("SKILL_POOLS") or {}
+    for _, pool in pairs(pools) do
+        for _, skill in ipairs(pool) do ids[#ids + 1] = tonumber(skill.spellId) end
+    end
+    return ids
+end
+local idsBefore = poolSpellIds()
+assertTrue(#idsBefore > 0, "批 5：禁用前技能池非空")
+local disabledSpellId = idsBefore[1]
+if type(applySkillConfig) == "function" and type(activePresetKey) == "string" then
+    feelConfig.disabledSkills = {[activePresetKey] = tostring(disabledSpellId)}
+    applySkillConfig(activePresetKey, "standard")
+    local idsAfter = poolSpellIds()
+    local stillPresent = false
+    for _, spellId in ipairs(idsAfter) do
+        if spellId == disabledSpellId then stillPresent = true end
+    end
+    assertTrue(stillPresent == false,
+        "批 5：被禁用的 spellId 已从技能池剔除（" .. tostring(disabledSpellId) .. "）")
+    assertEq(#idsAfter, #idsBefore - (function()
+        local count = 0
+        for _, spellId in ipairs(idsBefore) do if spellId == disabledSpellId then count = count + 1 end end
+        return count
+    end)(), "批 5：启停只剔除目标条目，其余技能池条目数量不变")
+
+    local comboStillPresent = false
+    for _, combo in ipairs(bossLocal("COMBO_CHAINS") or {}) do
+        for _, skillInfo in ipairs(combo.skills or {}) do
+            if tonumber(skillInfo[1]) == disabledSpellId then comboStillPresent = true end
+        end
+    end
+    assertTrue(comboStillPresent == false, "批 5：被禁用的 spellId 也已从连招里剔除")
+
+    local openingStillPresent = false
+    for _, skill in ipairs(bossLocal("OPENING_SKILLS") or {}) do
+        if tonumber(skill.spellId) == disabledSpellId then openingStillPresent = true end
+    end
+    assertTrue(openingStillPresent == false, "批 5：被禁用的 spellId 也已从开场技能里剔除")
+
+    feelConfig.disabledSkills = {}
+    applySkillConfig(activePresetKey, "standard")
+    assertEq(#poolSpellIds(), #idsBefore, "批 5：清空启停配置后技能池恢复原样")
+else
+    fail("批 5：取不到 ApplySkillConfig，无法验证条目启停")
+end
+
+-- ---------------------------------------------------------------- 10. 主循环接入（结构回归）
+assertTrue(source:find("UpdateSoftEnrage(creature, state)", 1, true) ~= nil,
+    "批 5：主循环接入软狂暴")
+assertTrue(source:find("if CheckBossWipe(creature, state, currentThreatList, delay) then return end", 1, true) ~= nil,
+    "批 5：主循环接入团灭判定")
+assertTrue(source:find("SkillAI:ResolvePendingWarning(creature, state)", 1, true) ~= nil,
+    "批 5：主循环接入点名预警结算")
+assertTrue(source:find("not TargetSelector:IsCasting(creature) and TacticalAI:ShouldChase(creature, target)", 1, true) ~= nil,
+    "批 5：移动纳入空闲门控（读条期间不下发移动指令）")
+assertTrue(source:find('BossAnnounce("spawn", {BOSS_NAME = bossName', 1, true) ~= nil,
+    "批 5：生成路径接世界公告")
+assertTrue(source:find('BossAnnounce("restore", {BOSS_NAME = bossName', 1, true) ~= nil,
+    "批 5：跨重启恢复路径接世界公告")
+assertTrue(source:find('BossAnnounce("phase"', 1, true) ~= nil,
+    "批 5：阶段切换接世界公告")
+assertTrue(source:find("skill.condition, creature, target", 1, true) ~= nil and
+    source:find('GetConditionThreshold("many_attackers")', 1, true) ~= nil,
+    "批 5：条件判定走可配阈值（CheckCondition 已改用 GetConditionThreshold）")
+env.type = savedFeelType
+end)()
+
 
 -- --------------------------------------------------------------------- 汇总
 -- 可选：把本次运行生成的所有 SQL 落盘，便于人工复核语句是否符合预期。
